@@ -1,48 +1,53 @@
-import google.generativeai as genai
-import os
-import json
+import discord
+from discord.ext import commands
+from services.gemini_service import gemini_ai
+from core.license_manager import LicenseManager
 import logging
-from typing import Dict, Any
 
-logger = logging.getLogger("Klaud.Gemini")
+logger = logging.getLogger("Klaud.AdminAI")
 
-class GeminiService:
+class AdminAI(commands.Cog):
     """
-    Advanced Intent Analysis Service.
-    Uses Gemini-1.5-Pro to interpret natural language into Discord Actions.
+    Handles natural language administrative tasks via Gemini.
     """
-    def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("GEMINI_API_KEY is missing!")
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
             return
-            
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-pro')
 
-    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
-        """
-        Determines if a user wants to perform an administrative action.
-        Must return valid JSON.
-        """
-        system_instructions = (
-            "You are KLAUD-NINJA AI. You translate user requests into JSON actions. "
-            "Available Actions: 'create_channels', 'none'. "
-            "For 'create_channels', include 'count' (int) and 'base_name' (str). "
-            "Only return raw JSON. No conversational text."
-        )
+        # Trigger only on bot mention
+        if self.bot.user.mentioned_in(message):
+            # STRICT LICENSE GATE
+            has_paid = await LicenseManager.require_paid(message.guild.id)
+            if not has_paid:
+                return # Silence or a minimal "Unlicensed" reply in main.py covers this.
 
-        try:
-            # Use safety settings to ensure the AI doesn't refuse harmless admin tasks
-            response = await self.model.generate_content_async(
-                f"{system_instructions}\n\nUser Request: {prompt}"
-            )
-            
-            # Clean up the response for JSON parsing
-            raw_text = response.text.strip().replace("```json", "").replace("```", "")
-            return json.loads(raw_text)
-        except Exception as e:
-            logger.error(f"Gemini Intent Parsing Failed: {e}")
-            return {"action": "none"}
+            prompt = message.content.replace(f'<@!{self.bot.user.id}>', '').replace(f'<@{self.bot.user.id}>', '').strip()
+            if not prompt:
+                return
 
-gemini_ai = GeminiService()
+            async with message.channel.typing():
+                # FIXED: Method name aligned with GeminiService
+                intent = await gemini_ai.parse_admin_intent(prompt)
+                
+                if intent.get('action') == 'create_channels':
+                    count = min(intent.get('count', 1), 5) 
+                    name = intent.get('base_name', 'staff-channel')
+                    
+                    if not message.guild.me.guild_permissions.manage_channels:
+                        return await message.reply("❌ I don't have 'Manage Channels' permissions.")
+
+                    for i in range(count):
+                        await message.guild.create_text_channel(name=f"{name}-{i+1}")
+                    
+                    await message.reply(f"✅ Created {count} channels as requested.")
+                
+                elif intent.get('action') == 'none':
+                    # Fallback for general conversation if paid
+                    pass 
+
+async def setup(bot):
+    await bot.add_cog(AdminAI(bot))
