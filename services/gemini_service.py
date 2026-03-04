@@ -1,64 +1,48 @@
 import google.generativeai as genai
+import os
 import json
-import re
-from config import settings
+import logging
+from typing import Dict, Any
 
-genai.configure(api_key=settings.GEMINI_API_KEY)
+logger = logging.getLogger("Klaud.Gemini")
 
 class GeminiService:
+    """
+    Advanced Intent Analysis Service.
+    Uses Gemini-1.5-Pro to interpret natural language into Discord Actions.
+    """
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            logger.error("GEMINI_API_KEY is missing!")
+            return
+            
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel('gemini-1.5-pro')
 
-    async def analyze_message(self, message: str, intensity: str, custom_prompt: str) -> dict:
-        prompt = f"""
-        You are Klaud, a highly advanced Discord moderation AI.
-        Analyze this message. Determine if it contains toxicity, swearing, harassment, spam, scams, NSFW, threats, or hate speech.
-        
-        Moderation Intensity: {intensity.upper()} (relaxed = allow mild, extreme = strict block).
-        Custom Admin Rules: {custom_prompt if custom_prompt else 'None. Follow standard safety.'}
-        
-        Message content: "{message}"
-        
-        Return ONLY valid JSON matching this schema exactly:
-        {{
-            "is_violating": boolean,
-            "reason": "short explanation of why it violates or why it is clean",
-            "suggested_action": "warn" | "delete" | "timeout" | "kick" | "ban" | "none"
-        }}
+    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
         """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            return self._extract_json(response.text)
-        except Exception:
-            return {"is_violating": False, "reason": "AI Error", "suggested_action": "none"}
-
-    async def parse_admin_command(self, user_instruction: str, server_context: str) -> dict:
-        prompt = f"""
-        You are Klaud, a Discord Server Architect AI. 
-        Convert the following natural language instruction into executable JSON actions.
-        Server Context: {server_context}
-        Instruction: "{user_instruction}"
-        
-        Supported Action Types: create_category, create_channel, delete_channel, rename_channel, create_role, lock_channel, unlock_channel.
-        
-        Return ONLY valid JSON:
-        {{
-            "actions": [
-                {{"type": "action_type", "name": "target_name", "category": "optional_parent_category"}}
-            ]
-        }}
+        Determines if a user wants to perform an administrative action.
+        Must return valid JSON.
         """
-        try:
-            response = await self.model.generate_content_async(prompt)
-            return self._extract_json(response.text)
-        except Exception:
-            return {"actions": []}
+        system_instructions = (
+            "You are KLAUD-NINJA AI. You translate user requests into JSON actions. "
+            "Available Actions: 'create_channels', 'none'. "
+            "For 'create_channels', include 'count' (int) and 'base_name' (str). "
+            "Only return raw JSON. No conversational text."
+        )
 
-    def _extract_json(self, text: str) -> dict:
-        match = re.search(r'\{.*\}', text.replace('\n', ' '), re.IGNORECASE)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                pass
-        return {}
+        try:
+            # Use safety settings to ensure the AI doesn't refuse harmless admin tasks
+            response = await self.model.generate_content_async(
+                f"{system_instructions}\n\nUser Request: {prompt}"
+            )
+            
+            # Clean up the response for JSON parsing
+            raw_text = response.text.strip().replace("```json", "").replace("```", "")
+            return json.loads(raw_text)
+        except Exception as e:
+            logger.error(f"Gemini Intent Parsing Failed: {e}")
+            return {"action": "none"}
+
+gemini_ai = GeminiService()
