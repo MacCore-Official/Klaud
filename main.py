@@ -10,220 +10,185 @@ import time
 import signal
 import traceback
 import platform
+import io
 from typing import Optional, List, Union, Dict, Any, Literal
 
-# Internal Infrastructure
+# Internal Authority Imports
 from database.connection import db
 from core.license_manager import LicenseManager
 from services.gemini_service import gemini_ai
 
-# --- HIGH-FIDELITY LOGGING ENGINE ---
-class KlaudSystemFormatter(logging.Formatter):
-    """Custom formatter for enterprise-grade log readability."""
-    grey = "\x1b[38;20m"
-    blue = "\x1b[34;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
-    format_str = "[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s (%(filename)s:%(lineno)d)"
-
-    FORMATS = {
-        logging.DEBUG: grey + format_str + reset,
-        logging.INFO: blue + format_str + reset,
-        logging.WARNING: yellow + format_str + reset,
-        logging.ERROR: red + format_str + reset,
-        logging.CRITICAL: bold_red + format_str + reset
-    }
-
+# --- PRODUCTION LOGGING CONFIGURATION ---
+class KlaudFormatter(logging.Formatter):
+    """Custom logs for Northflank/Production readability."""
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt, datefmt="%Y-%m-%d %H:%M:%S")
-        return formatter.format(record)
+        log_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        level = record.levelname
+        msg = record.getMessage()
+        return f"[{log_time}] [{level}] {record.name}: {msg}"
 
 logger = logging.getLogger("Klaud.Kernel")
 logger.setLevel(logging.INFO)
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setFormatter(KlaudSystemFormatter())
-logger.addHandler(stream_handler)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(KlaudFormatter())
+logger.addHandler(handler)
 
-# --- THE KLAUD-NINJA AUTHORITY ---
+# --- THE MASTER BOT CLASS ---
 class KlaudNinja(commands.Bot):
     """
-    KLAUD-NINJA ENTERPRISE OS v4.6.0
-    Constructed for high-concurrency environments and AI orchestration.
+    KLAUD-NINJA ENTERPRISE OS v4.7.0
+    A high-availability AI orchestrator built for the 2026 stable environment.
     """
     def __init__(self):
-        # Intents Configuration: Total Visibility Required
-        _intents = discord.Intents.all()
-        _intents.members = True
-        _intents.message_content = True
-        _intents.presences = True
+        # Intents: Absolute Visibility
+        intents = discord.Intents.all()
+        intents.members = True
+        intents.message_content = True
         
         super().__init__(
-            command_prefix=self._determine_prefix,
-            intents=_intents,
+            command_prefix=self.get_custom_prefix,
+            intents=intents,
             help_command=None,
             owner_id=1269145029943758899,
             chunk_guilds_at_startup=True,
-            heartbeat_timeout=180.0,
-            max_messages=10000
+            proxy=None
         )
         
-        # System Telemetry Data
-        self.start_time = time.time()
-        self.kernel_version = "2026.Q1.STABLE"
-        self.deployment_id = f"KLAUD-{os.uname().nodename if hasattr(os, 'uname') else 'LOCAL'}"
-        self.processed_messages = 0
-        self.ai_tokens_consumed = 0
+        # Internal Telemetry
+        self.boot_time = time.time()
+        self.version = "2026.PRO.STABLE"
+        self.total_packets_processed = 0
+        self.maintenance_lock = False
 
-    @staticmethod
-    async def _determine_prefix(bot, message: discord.Message) -> List[str]:
-        """Dynamic prefix resolution logic."""
-        return ["!", "k!", "ninja "]
+    async def get_custom_prefix(self, bot, message: discord.Message) -> List[str]:
+        """Dynamic prefix resolution."""
+        return ["!", "k!", "K!"]
 
     async def setup_hook(self) -> None:
-        """
-        The Pre-Gateway Boot Sequence.
-        Verifies database integrity and initializes all neural cogs.
-        """
-        logger.info("-" * 60)
-        logger.info(f"BOOTING KLAUD-NINJA OS ON {platform.system()} {platform.release()}")
-        logger.info(f"PYTHON VERSION: {sys.version}")
-        logger.info("-" * 60)
-        
-        # 1. Database Connectivity Auth
+        """The Master Initialization Sequence."""
+        logger.info("="*60)
+        logger.info(f"KLAUD-NINJA KERNEL BOOT: {platform.system()} {platform.machine()}")
+        logger.info(f"CORE VERSION: {self.version}")
+        logger.info("="*60)
+
+        # 1. DATABASE AUTHENTICATION
         try:
             await db.connect()
-            logger.info("✅ KERNEL: Database Persistence Pool [ONLINE]")
-        except Exception as error:
-            logger.critical(f"❌ KERNEL: Database Auth Failed. System Termination. | Error: {error}")
+            logger.info("✅ KERNEL: Database Connection Established.")
+        except Exception as e:
+            logger.critical(f"❌ KERNEL: Database Fatal Error: {e}")
             sys.exit(1)
 
-        # 2. Subsystem Mounting (Cogs)
-        await self._mount_subsystems()
+        # 2. EXTENSION MOUNTING
+        await self._load_all_extensions()
 
-        # 3. Command Synchronization
+        # 3. SLASH COMMAND SYNCHRONIZATION
         try:
-            logger.info("🔄 GATEWAY: Syncing Global Application Commands...")
+            logger.info("🔄 GATEWAY: Syncing Application Commands...")
             synced = await self.tree.sync()
-            logger.info(f"✅ GATEWAY: {len(synced)} Command Definitions Propagated.")
+            logger.info(f"✅ GATEWAY: {len(synced)} Global Commands Verified.")
         except Exception as e:
-            logger.error(f"⚠️ GATEWAY: Tree Sync Failure: {e}")
+            logger.error(f"⚠️ GATEWAY: Sync Failure: {e}")
 
-    async def _mount_subsystems(self):
-        """Iterative loading of modular components with error isolation."""
-        subsystem_path = './cogs'
-        if not os.path.exists(subsystem_path):
-            os.makedirs(subsystem_path)
+    async def _load_all_extensions(self):
+        """Iteratively mounts all Python modules in the cogs directory."""
+        cog_path = './cogs'
+        if not os.path.exists(cog_path):
+            os.makedirs(cog_path)
             return
 
-        for filename in os.listdir(subsystem_path):
+        for filename in os.listdir(cog_path):
             if filename.endswith('.py') and not filename.startswith('__'):
                 ext = f'cogs.{filename[:-3]}'
                 try:
                     await self.load_extension(ext)
-                    logger.info(f"✅ SUBSYSTEM: {ext} [MOUNTED]")
+                    logger.info(f"✅ SUBSYSTEM: {ext} Loaded.")
                 except Exception as e:
-                    logger.error(f"❌ SUBSYSTEM: {ext} [FAILED] | Traceback:\n{traceback.format_exc()}")
+                    logger.error(f"❌ SUBSYSTEM: {ext} Failed: {traceback.format_exc()}")
 
-    # --- GLOBAL INTERCEPTORS ---
+    # --- GLOBAL EVENT HANDLERS ---
     async def on_ready(self):
-        """Final execution state confirmation."""
-        uptime_delta = round(time.time() - self.start_time, 2)
-        logger.info("-" * 60)
-        logger.info(f"SYSTEM STATUS: FULLY AUTHORIZED")
-        logger.info(f"AUTHENTICATED AS: {self.user} (ID: {self.user.id})")
-        logger.info(f"STABILIZATION TIME: {uptime_delta}s")
-        logger.info("-" * 60)
+        """Final system stabilization check."""
+        elapsed = round(time.time() - self.boot_time, 2)
+        logger.info("="*60)
+        logger.info(f"SYSTEM STATUS: ONLINE AND AUTHORIZED")
+        logger.info(f"LOGGED IN AS: {self.user} ({self.user.id})")
+        logger.info(f"STABILIZATION TIME: {elapsed}s")
+        logger.info("="*60)
 
-        await self.change_presence(
-            status=discord.Status.online,
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="over Enterprise Assets | /license"
-            )
+        activity = discord.Activity(
+            type=discord.ActivityType.watching,
+            name="over Enterprise Assets | /license"
         )
+        await self.change_presence(status=discord.Status.online, activity=activity)
 
     async def on_message(self, message: discord.Message):
-        """
-        Primary Ingress Controller.
-        Enforces Global Licensing Gates for all AI-enabled interactions.
-        """
+        """Primary Ingress Traffic Controller."""
         if message.author.bot or not message.guild:
             return
 
-        self.processed_messages += 1
+        self.total_packets_processed += 1
 
-        # 1. Mention/AI Interaction Protocol
+        # MENTION PROTOCOL: The Gateway to AI Features
         if self.user.mentioned_in(message) and not message.mention_everyone:
-            # CHECK LICENSE: MANDATORY - NO FREE TIER ALLOWED
+            # LICENSE GATE: NO FREE TIER
             is_licensed = await LicenseManager.has_access(message.guild.id)
             
             if not is_licensed:
                 embed = discord.Embed(
-                    title="🛡️ KLAUD-NINJA: UNAUTHORIZED INSTANCE",
+                    title="🛡️ KLAUD: UNAUTHORIZED INSTANCE",
                     description=(
-                        "This server is running an **Unlicensed Version** of the KLAUD-NINJA OS.\n\n"
-                        "All AI-driven moderation, administrative tasks, and executive commands "
-                        "are locked behind a mandatory Enterprise Key."
+                        "**Access Denied.** This server lacks a valid Enterprise License.\n\n"
+                        "To activate AI protocols and executive commands, "
+                        "please redeem an authorized license key."
                     ),
-                    color=discord.Color.from_rgb(35, 35, 35),
+                    color=discord.Color.dark_red(),
                     timestamp=datetime.datetime.now()
                 )
-                embed.add_field(name="Deployment ID", value=f"`{self.deployment_id}`", inline=True)
-                embed.add_field(name="Action", value="Use `/license_redeem`", inline=True)
-                embed.set_footer(text="Contact System Administrator for Authorization")
+                embed.set_footer(text="Enterprise Infrastructure Protection")
                 return await message.reply(embed=embed)
 
-        # 2. Pipeline to Command Handlers
+        # Proceed to command logic
         await self.process_commands(message)
 
-    async def on_error(self, event_method, *args, **kwargs):
-        """Global exception capture for internal events."""
-        logger.error(f"INTERNAL EVENT ERROR in {event_method}:\n{traceback.format_exc()}")
+    async def on_error(self, event, *args, **kwargs):
+        """Global internal exception interceptor."""
+        logger.error(f"INTERNAL SYSTEM ERROR in {event}:\n{traceback.format_exc()}")
 
-# --- SHUTDOWN ORCHESTRATION ---
-async def terminate_system(bot: KlaudNinja):
-    """Graceful deconstruction of system resources."""
-    logger.info("--- INITIATING SYSTEM SHUTDOWN ---")
+# --- SHUTDOWN LOGIC ---
+async def shutdown(bot: KlaudNinja):
+    """Gracefully terminates all active connections."""
+    logger.info("Initiating Shutdown Sequence...")
     if db.pool:
         await db.pool.close()
-        logger.info("✅ DATABASE: Connection Pool Closed.")
-    
+        logger.info("Database closed.")
     await bot.close()
-    logger.info("✅ GATEWAY: Discord Connection Severed.")
-    
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    [t.cancel() for t in tasks]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    logger.info("✅ KERNEL: All Tasks Cleaned. Process Terminating.")
+    logger.info("Gateway closed. System Offline.")
 
-def run_production():
-    """Main process execution loop."""
+# --- ENTRY POINT ---
+def run_klaud():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        logger.critical("FATAL: DISCORD_TOKEN is not defined in the environment variables.")
+        logger.critical("DISCORD_TOKEN MISSING.")
         sys.exit(1)
 
     bot = KlaudNinja()
 
-    async def entry_point():
+    async def start():
         async with bot:
             try:
                 await bot.start(token)
             except Exception:
-                logger.error(f"CRITICAL KERNEL ERROR:\n{traceback.format_exc()}")
+                logger.error(f"FATAL BOOT ERROR:\n{traceback.format_exc()}")
 
-    # Loop Management for 24/7 Stability
+    # Managed Event Loop
     loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(entry_point())
+        loop.run_until_complete(start())
     except KeyboardInterrupt:
-        logger.info("SIGINT: Manual Override Detected.")
-        loop.run_until_complete(terminate_system(bot))
+        loop.run_until_complete(shutdown(bot))
     finally:
         loop.close()
 
 if __name__ == "__main__":
-    run_production()
+    run_klaud()
