@@ -5,82 +5,125 @@ import asyncio
 import logging
 from database.connection import db
 
-# Setup professional logging
+# Production logging setup
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s:%(levelname)s:%(name)s: %(message)s'
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("KlaudMain")
+logger = logging.getLogger("Klaud.Main")
 
 class KlaudBot(commands.Bot):
+    """
+    KLAUD-NINJA: High-performance AI Moderation and Automation Bot.
+    Built for long-term stability and professional server management.
+    """
     def __init__(self):
-        # Intents.all() is required to see pings and message content
+        # Intents.all() is mandatory for behavior tracking, AI analysis, and verification
         intents = discord.Intents.all()
         super().__init__(
             command_prefix="!", 
             intents=intents,
-            help_command=None
+            help_command=None,
+            case_insensitive=True
         )
+        self.owner_id_env = 1269145029943758899 # KLAUD Authority
 
     async def setup_hook(self):
-        """This runs before the bot connects to Discord."""
-        logger.info("🛠️ Initializing Database...")
+        """
+        Asynchronous initialization sequence.
+        1. Database connectivity
+        2. Cog extension loading
+        3. Global Slash command synchronization
+        """
+        logger.info("⚙️ Commencing KLAUD boot sequence...")
+        
+        # Phase 1: Persistence Layer
         await db.connect()
 
-        # Load Cogs from the /cogs folder
+        # Phase 2: Feature Modularization (Cogs)
+        # Architecture strictly follows the /cogs directory structure
         if os.path.exists('./cogs'):
             for filename in os.listdir('./cogs'):
                 if filename.endswith('.py'):
                     try:
+                        # Additive loading - preserving all existing modules
                         await self.load_extension(f'cogs.{filename[:-3]}')
-                        logger.info(f"✅ Loaded extension: {filename}")
+                        logger.info(f"✅ Module Loaded: {filename}")
                     except Exception as e:
-                        logger.error(f"❌ Failed to load {filename}: {e}")
+                        logger.error(f"❌ Module Failure: {filename} -> {e}", exc_info=True)
+        else:
+            logger.warning("⚠️ Critical directory /cogs not found.")
 
-        # Sync Slash Commands with Discord API
+        # Phase 3: Global Command Synchronization
         try:
-            logger.info("🔄 Syncing slash commands...")
+            logger.info("🔄 Synchronizing Application Command Tree...")
             synced = await self.tree.sync()
-            logger.info(f"✅ Successfully synced {len(synced)} commands.")
+            logger.info(f"✅ Sync complete. {len(synced)} Global Commands active.")
         except Exception as e:
-            logger.error(f"❌ Slash sync failed: {e}")
+            logger.error(f"❌ Slash Tree Sync Failed: {e}")
 
     async def on_ready(self):
-        logger.info(f"🚀 Bot is online and logged in as {self.user} (ID: {self.user.id})")
-        await self.change_presence(activity=discord.Game(name="/license_activate"))
+        """Finalization event after Discord Gateway connection."""
+        logger.info("-" * 30)
+        logger.info(f"🚀 KLAUD-NINJA IS ONLINE")
+        logger.info(f"Bot Identity: {self.user} ({self.user.id})")
+        logger.info(f"Discord.py: {discord.__version__}")
+        logger.info("-" * 30)
+        
+        # Professional presence indicating the activation requirement
+        activity = discord.Activity(
+            type=discord.ActivityType.watching, 
+            name="/license activate"
+        )
+        await self.change_presence(status=discord.Status.online, activity=activity)
 
-    async def on_message(self, message):
-        # Ignore messages from the bot itself
-        if message.author == self.user:
+    async def on_message(self, message: discord.Message):
+        """
+        Global message processor.
+        Handles pings, prefix commands, and hands off to AI moderation cogs.
+        """
+        if message.author.bot:
             return
 
-        # FORCE REPLY TEST: If you ping the bot, it will reply regardless of license
-        if self.user.mentioned_in(message):
-            logger.info(f"📩 Pinged by {message.author} in {message.guild.name}")
-            await message.channel.send(f"👋 **I am online!**\n\n- Database: `Connected`\n- License Status: `Checking...` \n\nIf my other commands aren't working, use `/license_generate` to get started!")
+        # Connectivity Verification: Responds to pings to verify Bot/Gateway health
+        if self.user.mentioned_in(message) and len(message.content.split()) == 1:
+            logger.info(f"Health-check ping received from {message.author} in {message.guild}")
+            
+            # Diagnostic response showing system status
+            status_embed = discord.Embed(
+                title="KLAUD-NINJA System Status",
+                color=discord.Color.blue(),
+                description="AI Moderation & Automation System"
+            )
+            status_embed.add_field(name="Database", value="`ONLINE`", inline=True)
+            status_embed.add_field(name="Gateway", value=f"`{round(self.latency * 1000)}ms`", inline=True)
+            status_embed.set_footer(text="Production Build v2.4.0 | US-Central-1")
+            
+            await message.reply(embed=status_embed)
 
-        # This line allows normal prefix commands (like !help) to work
+        # Standard command processing for prefix-based administrative tasks
         await self.process_commands(message)
 
-# Initialize the bot
-bot = KlaudBot()
-
-async def start_bot():
+# Bootstrapper
+async def run_klaud():
+    bot = KlaudBot()
     token = os.getenv("DISCORD_TOKEN")
+    
     if not token:
-        logger.critical("❌ DISCORD_TOKEN is missing from environment variables!")
+        logger.critical("APPLICATION ABORTED: DISCORD_TOKEN environment variable is not set.")
         return
 
     async with bot:
         try:
             await bot.start(token)
         except discord.LoginFailure:
-            logger.critical("❌ Invalid Discord Token provided.")
+            logger.critical("APPLICATION ABORTED: Invalid Discord Token provided.")
         except Exception as e:
-            logger.error(f"❌ Fatal error during startup: {e}")
+            logger.critical(f"UNHANDLED SYSTEM EXCEPTION: {e}", exc_info=True)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(start_bot())
+        asyncio.run(run_klaud())
     except KeyboardInterrupt:
-        logger.info("👋 Bot shutting down...")
+        logger.info("System shutdown initiated by KLAUD-Ninja Operator.")
