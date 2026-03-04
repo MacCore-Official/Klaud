@@ -1,53 +1,74 @@
-import discord
-from discord.ext import commands
-from services.gemini_service import gemini_ai
-from core.license_manager import LicenseManager
+import google.generativeai as genai
+import os
+import json
 import logging
+from typing import Dict, Any, Optional
 
-logger = logging.getLogger("Klaud.AdminAI")
+# Senior-level logging configuration
+logger = logging.getLogger("Klaud.Gemini")
 
-class AdminAI(commands.Cog):
+class GeminiService:
     """
-    Handles natural language administrative tasks via Gemini.
+    KLAUD-NINJA NEURAL CORE.
+    Handles all generative and analytical requests for the bot.
     """
-    def __init__(self, bot):
-        self.bot = bot
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+    def __init__(self):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
+            logger.critical("GEMINI_API_KEY NOT FOUND. AI SERVICES DISABLED.")
             return
+            
+        genai.configure(api_key=self.api_key)
+        # Using the most stable 2026 production model
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
 
-        # Trigger only on bot mention
-        if self.bot.user.mentioned_in(message):
-            # STRICT LICENSE GATE
-            has_paid = await LicenseManager.require_paid(message.guild.id)
-            if not has_paid:
-                return # Silence or a minimal "Unlicensed" reply in main.py covers this.
+    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
+        """
+        Translates human instructions into executable JSON schemas.
+        """
+        system_instructions = (
+            "SYSTEM: KLAUD-NINJA_EXEC_OS_2026\n"
+            "TASK: Intent Extraction\n"
+            "OUTPUT: Valid JSON ONLY\n"
+            "ACTIONS: \n"
+            "- create_channels: {'action': 'create_channels', 'count': int, 'base_name': str}\n"
+            "- purge_messages: {'action': 'purge', 'count': int}\n"
+            "- none: {'action': 'none'}"
+        )
 
-            prompt = message.content.replace(f'<@!{self.bot.user.id}>', '').replace(f'<@{self.bot.user.id}>', '').strip()
-            if not prompt:
-                return
+        try:
+            # We use a lower temperature for extraction to ensure JSON validity
+            response = await self.model.generate_content_async(
+                f"{system_instructions}\n\nUSER_REQUEST: {prompt}",
+                generation_config=genai.types.GenerationConfig(temperature=0.1)
+            )
+            
+            clean_json = response.text.strip().replace("```json", "").replace("```", "")
+            return json.loads(clean_json)
+        except Exception as e:
+            logger.error(f"Intent Parsing Error: {e}")
+            return {"action": "none"}
 
-            async with message.channel.typing():
-                # FIXED: Method name aligned with GeminiService
-                intent = await gemini_ai.parse_admin_intent(prompt)
-                
-                if intent.get('action') == 'create_channels':
-                    count = min(intent.get('count', 1), 5) 
-                    name = intent.get('base_name', 'staff-channel')
-                    
-                    if not message.guild.me.guild_permissions.manage_channels:
-                        return await message.reply("❌ I don't have 'Manage Channels' permissions.")
+    async def analyze_content(self, content: str, rules: str) -> Dict[str, Any]:
+        """
+        Deep-packet inspection of message content for moderation violations.
+        """
+        mod_prompt = (
+            f"MODERATION_KERNEL_V4\nRULES: {rules}\n"
+            "OUTPUT_FORMAT: JSON\n"
+            "FIELDS: violation (bool), reason (string), severity (low|medium|high), action (warn|timeout|kick)"
+        )
 
-                    for i in range(count):
-                        await message.guild.create_text_channel(name=f"{name}-{i+1}")
-                    
-                    await message.reply(f"✅ Created {count} channels as requested.")
-                
-                elif intent.get('action') == 'none':
-                    # Fallback for general conversation if paid
-                    pass 
+        try:
+            response = await self.model.generate_content_async(
+                f"{mod_prompt}\n\nCONTENT_TO_SCAN: {content}",
+                generation_config=genai.types.GenerationConfig(temperature=0.0)
+            )
+            clean_json = response.text.strip().replace("```json", "").replace("```", "")
+            return json.loads(clean_json)
+        except Exception as e:
+            logger.error(f"Moderation Logic Error: {e}")
+            return {"violation": False}
 
-async def setup(bot):
-    await bot.add_cog(AdminAI(bot))
+# Singleton instance for global app use
+gemini_ai = GeminiService()
