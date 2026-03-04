@@ -1,132 +1,111 @@
 import discord
 from discord.ext import commands
 import os
-import asyncio
 import logging
+import asyncio
 from database.connection import db
+from core.license_manager import LicenseManager
+from services.gemini_service import gemini_ai
 
-# Configuration for Production-Grade Logging
-# Ensures all events from Database to Cogs are captured in Northflank logs.
+# Setup Exhaustive Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
 )
 logger = logging.getLogger("Klaud.Main")
 
 class KlaudBot(commands.Bot):
-    """
-    KLAUD-NINJA: Advanced AI Moderation & Automation Platform.
-    Architecture designed for high availability and tiered server authorization.
-    """
     def __init__(self):
-        # Intents.all() is required for:
-        # 1. Message Content (AI Analysis)
-        # 2. Server Members (Verification/Auto-role)
-        # 3. Presence/Voice (Behavior scoring)
         intents = discord.Intents.all()
         super().__init__(
             command_prefix="!", 
             intents=intents,
-            help_command=None,
-            case_insensitive=True
+            help_command=None
         )
-        # Permanent Authority Reference
-        self.owner_id_env = 1269145029943758899
+        self.owner_id_val = 1269145029943758899
 
     async def setup_hook(self):
-        """
-        Pre-initialization lifecycle hook.
-        Establishes database connections and loads feature modules.
-        """
-        logger.info("Initializing KLAUD-NINJA Production Environment...")
-        
-        # 1. Establish Database Pool
+        logger.info("Initializing KLAUD-NINJA Production Systems...")
         await db.connect()
 
-        # 2. Dynamic Cog Loading
-        # Scans the /cogs directory to initialize features like Moderation, AI, and Licensing.
+        # Load Extensions
         if os.path.exists('./cogs'):
             for filename in os.listdir('./cogs'):
                 if filename.endswith('.py'):
                     try:
                         await self.load_extension(f'cogs.{filename[:-3]}')
-                        logger.info(f"✅ Subsystem Loaded: {filename}")
+                        logger.info(f"✅ Cog Loaded: {filename}")
                     except Exception as e:
-                        # Non-fatal error logging: allows other cogs to continue loading
-                        logger.error(f"❌ Subsystem Failure: {filename} -> {e}")
-        else:
-            logger.critical("FATAL: /cogs directory is missing. Core functionality unavailable.")
+                        logger.error(f"❌ Cog Failed: {filename} -> {e}")
 
-        # 3. Application Command Synchronization
-        # Synchronizes Slash commands globally with the Discord API.
-        try:
-            logger.info("🔄 Synchronizing Command Tree with Discord Gateway...")
-            synced = await self.tree.sync()
-            logger.info(f"✅ Synchronization Successful. {len(synced)} Global Commands Registered.")
-        except Exception as e:
-            logger.error(f"⚠️ Command Tree Sync Error: {e}")
-
-    async def on_ready(self):
-        """
-        Ready event triggered once the bot is connected and cached.
-        """
-        logger.info("-" * 40)
-        logger.info(f"🚀 KLAUD-NINJA IS DEPLOYED AND ONLINE")
-        logger.info(f"Username: {self.user} (ID: {self.user.id})")
-        logger.info(f"Latency: {round(self.latency * 1000)}ms")
-        logger.info("-" * 40)
-        
-        # Professional status display
-        activity = discord.Activity(
-            type=discord.ActivityType.watching, 
-            name="over servers | /license"
-        )
-        await self.change_presence(status=discord.Status.online, activity=activity)
+        # Global Sync
+        await self.tree.sync()
+        logger.info("✅ Slash Command Tree Synchronized.")
 
     async def on_message(self, message: discord.Message):
-        """
-        Universal message handler for pings, prefix-commands, and AI triggers.
-        """
-        if message.author.bot:
+        if message.author.bot or not message.guild:
             return
 
-        # Connectivity health-check: Bot responds when pinged without content
-        if self.user.mentioned_in(message) and len(message.content.split()) == 1:
-            logger.info(f"Ping received from {message.author} in {message.guild.name}")
+        # 🤖 AI ADMIN HANDLER (PINGS)
+        if self.user.mentioned_in(message):
+            logger.info(f"Processing AI Request from {message.author} in {message.guild.id}")
             
-            embed = discord.Embed(
-                title="KLAUD-NINJA Status",
-                color=discord.Color.blue(),
-                description="Advanced AI Moderation & Automation"
-            )
-            embed.add_field(name="Infrastructure", value="`Northflank`", inline=True)
-            embed.add_field(name="Database", value="`PostgreSQL Online`", inline=True)
-            embed.add_field(name="Latency", value=f"`{round(self.latency * 1000)}ms`", inline=True)
-            embed.set_footer(text="Use /license_status to check server activation.")
+            # 1. License Check
+            # Only users with 'paid' tier can use AI Admin Actions
+            is_authorized = await LicenseManager.require_paid(message.guild.id)
             
-            await message.reply(embed=embed)
+            if not is_authorized:
+                embed = discord.Embed(
+                    title="💎 Premium Access Required",
+                    description=(
+                        "AI Administrative actions (like mass-creating channels) require a **Paid License**.\n\n"
+                        "Please use `/license_status` to check your tier or `/license_redeem` to upgrade."
+                    ),
+                    color=discord.Color.gold()
+                )
+                return await message.reply(embed=embed)
 
-        # Allow commands.Cog functionality and !prefix commands
+            # 2. Extract Prompt
+            prompt = message.content.replace(f'<@!{self.user.id}>', '').replace(f'<@{self.user.id}>', '').strip()
+            
+            if not prompt:
+                return await message.reply("👋 KLAUD-NINJA Online. How can I manage your server today?")
+
+            # 3. Process Intent with Gemini
+            async with message.channel.typing():
+                intent = await gemini_ai.parse_admin_intent(prompt)
+                
+                if intent.get('action') == 'create_channels':
+                    count = min(intent.get('count', 1), 10) # Security Cap
+                    name = intent.get('base_name', 'staff-channel')
+                    
+                    # Verify permissions
+                    if not message.guild.me.guild_permissions.manage_channels:
+                        return await message.reply("❌ Error: I lack the 'Manage Channels' permission.")
+
+                    for i in range(count):
+                        await message.guild.create_text_channel(name=f"{name}-{i+1}")
+                    
+                    await message.reply(f"✅ **AI Task Executed:** Created {count} channels with base name `{name}`.")
+                else:
+                    await message.reply("🧠 I'm listening, but that action isn't mapped to my admin protocols yet.")
+
         await self.process_commands(message)
 
-# System Execution
-async def main():
-    bot = KlaudBot()
+# Global Lifecycle Management
+bot = KlaudBot()
+
+async def start_system():
     token = os.getenv("DISCORD_TOKEN")
-    
     if not token:
-        logger.critical("CORE ERROR: DISCORD_TOKEN not found in environment.")
+        logger.critical("DISCORD_TOKEN MISSING")
         return
 
     async with bot:
-        try:
-            await bot.start(token)
-        except Exception as e:
-            logger.critical(f"UNHANDLED BOOT EXCEPTION: {e}", exc_info=True)
+        await bot.start(token)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(start_system())
     except KeyboardInterrupt:
-        logger.info("KLAUD-NINJA shutdown by operator.")
+        logger.info("System Shutdown.")
