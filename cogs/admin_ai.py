@@ -1,74 +1,53 @@
 import discord
 from discord.ext import commands
+from services.gemini_service import gemini_ai
 from core.license_manager import LicenseManager
-from services.gemini_service import GeminiService
-from utils.smart_logger import log_action
+import logging
+
+logger = logging.getLogger("Klaud.AdminAI")
 
 class AdminAI(commands.Cog):
+    """
+    Handles natural language administrative tasks via Gemini.
+    """
     def __init__(self, bot):
         self.bot = bot
-        self.ai = GeminiService()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild: return
-        if not self.bot.user.mentioned_in(message): return
-        
-        # Only Admins/Owners
-        if not message.author.guild_permissions.administrator and message.author.id != self.bot.owner_id:
+        if message.author.bot or not message.guild:
             return
 
-        # Requires PAID license
-        if not await LicenseManager.require_paid(message.guild.id):
-            await message.reply("⚠️ **AI Admin Commands require a Paid License.**")
-            return
+        # Trigger only on bot mention
+        if self.bot.user.mentioned_in(message):
+            # STRICT LICENSE GATE
+            has_paid = await LicenseManager.require_paid(message.guild.id)
+            if not has_paid:
+                return # Silence or a minimal "Unlicensed" reply in main.py covers this.
 
-        clean_instruction = message.content.replace(f'<@{self.bot.user.id}>', '').strip()
-        if not clean_instruction: return
+            prompt = message.content.replace(f'<@!{self.bot.user.id}>', '').replace(f'<@{self.bot.user.id}>', '').strip()
+            if not prompt:
+                return
 
-        async with message.channel.typing():
-            context = f"Guild: {message.guild.name}, Categories: {[c.name for c in message.guild.categories]}"
-            data = await self.ai.parse_admin_command(clean_instruction, context)
-            
-            actions_taken = []
-            if data and "actions" in data:
-                for action in data["actions"]:
-                    try:
-                        await self.execute_action(message.guild, action)
-                        actions_taken.append(f"{action.get('type')}: {action.get('name')}")
-                    except discord.Forbidden:
-                        actions_taken.append(f"❌ Failed (No Perms): {action.get('type')}")
-                    except Exception as e:
-                        actions_taken.append(f"❌ Failed (Error): {e}")
+            async with message.channel.typing():
+                # FIXED: Method name aligned with GeminiService
+                intent = await gemini_ai.parse_admin_intent(prompt)
+                
+                if intent.get('action') == 'create_channels':
+                    count = min(intent.get('count', 1), 5) 
+                    name = intent.get('base_name', 'staff-channel')
+                    
+                    if not message.guild.me.guild_permissions.manage_channels:
+                        return await message.reply("❌ I don't have 'Manage Channels' permissions.")
 
-            if actions_taken:
-                result_str = "\n".join(actions_taken)
-                await message.reply(f"✅ **AI Actions Executed:**\n```\n{result_str}\n```")
-                await log_action(message.guild, "🛠️ AI Admin Action", message.author, result_str, discord.Color.blue())
-            else:
-                await message.reply("❌ Klaud could not understand the requested action or none were needed.")
-
-    async def execute_action(self, guild: discord.Guild, action: dict):
-        a_type = action.get("type")
-        name = action.get("name")
-        
-        if a_type == "create_category":
-            await guild.create_category(name)
-        elif a_type == "create_channel":
-            cat_name = action.get("category")
-            category = discord.utils.get(guild.categories, name=cat_name) if cat_name else None
-            await guild.create_text_channel(name, category=category)
-        elif a_type == "delete_channel":
-            channel = discord.utils.get(guild.channels, name=name)
-            if channel: await channel.delete()
-        elif a_type == "create_role":
-            await guild.create_role(name=name)
-        elif a_type == "lock_channel":
-            channel = discord.utils.get(guild.channels, name=name)
-            if channel: await channel.set_permissions(guild.default_role, send_messages=False)
-        elif a_type == "unlock_channel":
-            channel = discord.utils.get(guild.channels, name=name)
-            if channel: await channel.set_permissions(guild.default_role, send_messages=True)
+                    for i in range(count):
+                        await message.guild.create_text_channel(name=f"{name}-{i+1}")
+                    
+                    await message.reply(f"✅ Created {count} channels as requested.")
+                
+                elif intent.get('action') == 'none':
+                    # Fallback for general conversation if paid
+                    pass 
 
 async def setup(bot):
     await bot.add_cog(AdminAI(bot))
