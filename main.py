@@ -7,7 +7,7 @@ from database.connection import db
 from core.license_manager import LicenseManager
 from services.gemini_service import gemini_ai
 
-# Setup Exhaustive Logging
+# Setup Exhaustive Logging test
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
