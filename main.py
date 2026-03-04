@@ -1,104 +1,143 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
-from typing import Optional, List, Dict, Any
-from services.gemini_service import gemini_ai
-from core.license_manager import LicenseManager
-from database.connection import db
+import os
+import sys
+import asyncio
 import logging
-import datetime
+import signal
+from typing import List
 
-logger = logging.getLogger("Klaud.Moderation")
+# Professional Logic Imports
+from database.connection import db
+from core.license_manager import LicenseManager
+from services.gemini_service import gemini_ai
 
-class Moderation(commands.Cog):
+# --- STANDARDIZED LOGGING ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger("Klaud.Main")
+
+class KlaudNinja(commands.Bot):
     """
-    KLAUD AI-DRIVEN MODERATION SUBSYSTEM.
-    Implements deep-content analysis and automated disciplinary actions.
+    KLAUD-NINJA MASTER AUTHORITY v4.5
+    Constructed for 24/7 high-availability deployment.
     """
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.default_rules = "Standard professional moderation. Block toxicity and hate speech."
+    def __init__(self):
+        # Intents are mandatory for AI message reading
+        intents = discord.Intents.all()
+        
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            help_command=None,
+            owner_id=1269145029943758899
+        )
+        self.system_version = "2026.1.PRO"
 
-    @commands.Cog.listener()
+    async def setup_hook(self) -> None:
+        """
+        The critical boot sequence. 
+        If any of this fails, the bot will intentionally crash (Exit 1) 
+        so the container can restart.
+        """
+        logger.info(f"--- BOOTING KLAUD-NINJA OS v{self.system_version} ---")
+
+        # 1. DATABASE CONNECTIVITY
+        try:
+            await db.connect()
+            logger.info("✅ Persistence Layer: ONLINE")
+        except Exception as e:
+            logger.critical(f"❌ Persistence Layer: FAILED ({e})")
+            sys.exit(1)
+
+        # 2. COG SUBSYSTEM INITIALIZATION
+        # We only load 'cogs' to avoid loading 'core' utilities as extensions
+        cog_dir = './cogs'
+        if os.path.exists(cog_dir):
+            for filename in os.listdir(cog_dir):
+                if filename.endswith('.py') and not filename.startswith('__'):
+                    try:
+                        await self.load_extension(f'cogs.{filename[:-3]}')
+                        logger.info(f"✅ Subsystem: {filename} LOADED")
+                    except Exception as e:
+                        logger.error(f"❌ Subsystem: {filename} ERROR ({e})")
+
+        # 3. GLOBAL SLASH COMMAND SYNC
+        try:
+            logger.info("🔄 Synchronizing Command Tree...")
+            await self.tree.sync()
+            logger.info("✅ Command Tree: SYNCED")
+        except Exception as e:
+            logger.error(f"⚠️ Command Tree Sync Warning: {e}")
+
+    async def on_ready(self):
+        logger.info("-" * 40)
+        logger.info(f"KLAUD-NINJA AUTHORIZED: {self.user}")
+        logger.info(f"GATEWAY LATENCY: {round(self.latency * 1000)}ms")
+        logger.info("-" * 40)
+        
+        # Set Activity
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching, 
+                name="over Enterprise Assets"
+            )
+        )
+
     async def on_message(self, message: discord.Message):
         """
-        Real-time listener for content analysis.
-        Strictly gated by LicenseManager.
+        The Hard-Gate License Check.
+        No License = The Bot ignores all AI/Mod pings.
         """
         if message.author.bot or not message.guild:
             return
 
-        # 1. License Check
-        if not await LicenseManager.has_access(message.guild.id):
-            return
-
-        # 2. Staff Immunity: Skip AI check for admins/mods
-        if message.author.guild_permissions.manage_messages:
-            return
-
-        # 3. Rule Context: Fetch server-specific AI instructions
-        row = await db.fetchrow(
-            "SELECT custom_prompt FROM guild_settings WHERE guild_id = $1", 
-            message.guild.id
-        )
-        current_rules = row['custom_prompt'] if row and row['custom_prompt'] else self.default_rules
-
-        # 4. Neural Analysis
-        try:
-            analysis = await gemini_ai.analyze_content(message.content, current_rules)
+        # Check if the bot is mentioned (AI Command Trigger)
+        if self.user.mentioned_in(message):
+            # Strict License Logic
+            is_licensed = await LicenseManager.has_access(message.guild.id)
             
-            if analysis.get('violation'):
-                await self.apply_discipline(message, analysis)
-        except Exception as e:
-            logger.error(f"Moderation neural failure in {message.guild.id}: {e}")
+            if not is_licensed:
+                embed = discord.Embed(
+                    title="🔒 SYSTEM DORMANT",
+                    description="This server is not authorized. Please redeem a **KLAUD-Key**.",
+                    color=discord.Color.dark_red()
+                )
+                return await message.reply(embed=embed)
 
-    async def apply_discipline(self, message: discord.Message, data: Dict[str, Any]):
-        """
-        Executes the AI-suggested punishment.
-        """
-        reason = data.get('reason', 'Violation of server protocol.')
-        severity = data.get('severity', 'low')
-        
-        # Action 1: Content Removal
+        await self.process_commands(message)
+
+# --- EXECUTION WRAPPER ---
+# This is what keeps the container from exiting with Code 0.
+async def run_system():
+    token = os.getenv("DISCORD_TOKEN")
+    
+    if not token:
+        logger.critical("FATAL: DISCORD_TOKEN is missing. System cannot start.")
+        sys.exit(1)
+
+    bot = KlaudNinja()
+    
+    # Use 'async with' for clean resource management
+    async with bot:
         try:
-            await message.delete()
-        except discord.Forbidden:
-            logger.warning(f"Permissions missing to delete message in {message.guild.id}")
+            # This starts the bot and waits forever
+            await bot.start(token)
+        except KeyboardInterrupt:
+            logger.info("Manual shutdown signal received.")
+        except Exception as e:
+            logger.critical(f"System encountered a fatal runtime error: {e}")
+        finally:
+            if not bot.is_closed():
+                await bot.close()
+            logger.info("System Cleanup Complete. Exiting.")
 
-        # Action 2: Infraction Logging
-        await db.execute(
-            """INSERT INTO infractions (guild_id, user_id, reason, severity, timestamp) 
-               VALUES ($1, $2, $3, $4, $5)""",
-            message.guild.id, message.author.id, reason, severity, datetime.datetime.now()
-        )
-
-        # Action 3: User Notification
-        embed = discord.Embed(
-            title="🛡️ KLAUD INTERVENTION",
-            description=f"{message.author.mention}, your content was removed for violating server protocols.",
-            color=discord.Color.red() if severity == 'high' else discord.Color.orange(),
-            timestamp=datetime.datetime.now()
-        )
-        embed.add_field(name="Reason", value=f"```{reason}```")
-        embed.set_footer(text=f"Severity: {severity.upper()} | Automated AI Moderation")
-        
-        await message.channel.send(embed=embed, delete_after=15)
-        logger.info(f"MODERATION: Purged content from {message.author} in {message.guild.id}")
-
-    @app_commands.command(name="mod_config", description="Update the AI moderation instructions for KLAUD.")
-    @app_commands.describe(prompt="The rules KLAUD should follow (e.g. 'Be strict about swearing')")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def mod_config(self, interaction: discord.Interaction, prompt: str):
-        """Allows administrators to fine-tune the AI brain."""
-        if not await LicenseManager.has_access(interaction.guild.id):
-            return await interaction.response.send_message("❌ System License Required.", ephemeral=True)
-
-        await db.execute(
-            """INSERT INTO guild_settings (guild_id, custom_prompt) 
-               VALUES ($1, $2) ON CONFLICT (guild_id) DO UPDATE SET custom_prompt = $2""",
-            interaction.guild.id, prompt
-        )
-        await interaction.response.send_message(f"✅ **AI Protocols Updated.** KLAUD will now: {prompt}")
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Moderation(bot))
+if __name__ == "__main__":
+    try:
+        # Standard Python 3.11+ way to run the async entry point
+        asyncio.run(run_system())
+    except KeyboardInterrupt:
+        pass
