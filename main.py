@@ -5,7 +5,8 @@ import asyncio
 import logging
 from database.connection import db
 
-# Production logging setup
+# Configuration for Production-Grade Logging
+# Ensures all events from Database to Cogs are captured in Northflank logs.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -15,11 +16,14 @@ logger = logging.getLogger("Klaud.Main")
 
 class KlaudBot(commands.Bot):
     """
-    KLAUD-NINJA: High-performance AI Moderation and Automation Bot.
-    Built for long-term stability and professional server management.
+    KLAUD-NINJA: Advanced AI Moderation & Automation Platform.
+    Architecture designed for high availability and tiered server authorization.
     """
     def __init__(self):
-        # Intents.all() is mandatory for behavior tracking, AI analysis, and verification
+        # Intents.all() is required for:
+        # 1. Message Content (AI Analysis)
+        # 2. Server Members (Verification/Auto-role)
+        # 3. Presence/Voice (Behavior scoring)
         intents = discord.Intents.all()
         super().__init__(
             command_prefix="!", 
@@ -27,103 +31,102 @@ class KlaudBot(commands.Bot):
             help_command=None,
             case_insensitive=True
         )
-        self.owner_id_env = 1269145029943758899 # KLAUD Authority
+        # Permanent Authority Reference
+        self.owner_id_env = 1269145029943758899
 
     async def setup_hook(self):
         """
-        Asynchronous initialization sequence.
-        1. Database connectivity
-        2. Cog extension loading
-        3. Global Slash command synchronization
+        Pre-initialization lifecycle hook.
+        Establishes database connections and loads feature modules.
         """
-        logger.info("⚙️ Commencing KLAUD boot sequence...")
+        logger.info("Initializing KLAUD-NINJA Production Environment...")
         
-        # Phase 1: Persistence Layer
+        # 1. Establish Database Pool
         await db.connect()
 
-        # Phase 2: Feature Modularization (Cogs)
-        # Architecture strictly follows the /cogs directory structure
+        # 2. Dynamic Cog Loading
+        # Scans the /cogs directory to initialize features like Moderation, AI, and Licensing.
         if os.path.exists('./cogs'):
             for filename in os.listdir('./cogs'):
                 if filename.endswith('.py'):
                     try:
-                        # Additive loading - preserving all existing modules
                         await self.load_extension(f'cogs.{filename[:-3]}')
-                        logger.info(f"✅ Module Loaded: {filename}")
+                        logger.info(f"✅ Subsystem Loaded: {filename}")
                     except Exception as e:
-                        logger.error(f"❌ Module Failure: {filename} -> {e}", exc_info=True)
+                        # Non-fatal error logging: allows other cogs to continue loading
+                        logger.error(f"❌ Subsystem Failure: {filename} -> {e}")
         else:
-            logger.warning("⚠️ Critical directory /cogs not found.")
+            logger.critical("FATAL: /cogs directory is missing. Core functionality unavailable.")
 
-        # Phase 3: Global Command Synchronization
+        # 3. Application Command Synchronization
+        # Synchronizes Slash commands globally with the Discord API.
         try:
-            logger.info("🔄 Synchronizing Application Command Tree...")
+            logger.info("🔄 Synchronizing Command Tree with Discord Gateway...")
             synced = await self.tree.sync()
-            logger.info(f"✅ Sync complete. {len(synced)} Global Commands active.")
+            logger.info(f"✅ Synchronization Successful. {len(synced)} Global Commands Registered.")
         except Exception as e:
-            logger.error(f"❌ Slash Tree Sync Failed: {e}")
+            logger.error(f"⚠️ Command Tree Sync Error: {e}")
 
     async def on_ready(self):
-        """Finalization event after Discord Gateway connection."""
-        logger.info("-" * 30)
-        logger.info(f"🚀 KLAUD-NINJA IS ONLINE")
-        logger.info(f"Bot Identity: {self.user} ({self.user.id})")
-        logger.info(f"Discord.py: {discord.__version__}")
-        logger.info("-" * 30)
+        """
+        Ready event triggered once the bot is connected and cached.
+        """
+        logger.info("-" * 40)
+        logger.info(f"🚀 KLAUD-NINJA IS DEPLOYED AND ONLINE")
+        logger.info(f"Username: {self.user} (ID: {self.user.id})")
+        logger.info(f"Latency: {round(self.latency * 1000)}ms")
+        logger.info("-" * 40)
         
-        # Professional presence indicating the activation requirement
+        # Professional status display
         activity = discord.Activity(
             type=discord.ActivityType.watching, 
-            name="/license activate"
+            name="over servers | /license"
         )
         await self.change_presence(status=discord.Status.online, activity=activity)
 
     async def on_message(self, message: discord.Message):
         """
-        Global message processor.
-        Handles pings, prefix commands, and hands off to AI moderation cogs.
+        Universal message handler for pings, prefix-commands, and AI triggers.
         """
         if message.author.bot:
             return
 
-        # Connectivity Verification: Responds to pings to verify Bot/Gateway health
+        # Connectivity health-check: Bot responds when pinged without content
         if self.user.mentioned_in(message) and len(message.content.split()) == 1:
-            logger.info(f"Health-check ping received from {message.author} in {message.guild}")
+            logger.info(f"Ping received from {message.author} in {message.guild.name}")
             
-            # Diagnostic response showing system status
-            status_embed = discord.Embed(
-                title="KLAUD-NINJA System Status",
+            embed = discord.Embed(
+                title="KLAUD-NINJA Status",
                 color=discord.Color.blue(),
-                description="AI Moderation & Automation System"
+                description="Advanced AI Moderation & Automation"
             )
-            status_embed.add_field(name="Database", value="`ONLINE`", inline=True)
-            status_embed.add_field(name="Gateway", value=f"`{round(self.latency * 1000)}ms`", inline=True)
-            status_embed.set_footer(text="Production Build v2.4.0 | US-Central-1")
+            embed.add_field(name="Infrastructure", value="`Northflank`", inline=True)
+            embed.add_field(name="Database", value="`PostgreSQL Online`", inline=True)
+            embed.add_field(name="Latency", value=f"`{round(self.latency * 1000)}ms`", inline=True)
+            embed.set_footer(text="Use /license_status to check server activation.")
             
-            await message.reply(embed=status_embed)
+            await message.reply(embed=embed)
 
-        # Standard command processing for prefix-based administrative tasks
+        # Allow commands.Cog functionality and !prefix commands
         await self.process_commands(message)
 
-# Bootstrapper
-async def run_klaud():
+# System Execution
+async def main():
     bot = KlaudBot()
     token = os.getenv("DISCORD_TOKEN")
     
     if not token:
-        logger.critical("APPLICATION ABORTED: DISCORD_TOKEN environment variable is not set.")
+        logger.critical("CORE ERROR: DISCORD_TOKEN not found in environment.")
         return
 
     async with bot:
         try:
             await bot.start(token)
-        except discord.LoginFailure:
-            logger.critical("APPLICATION ABORTED: Invalid Discord Token provided.")
         except Exception as e:
-            logger.critical(f"UNHANDLED SYSTEM EXCEPTION: {e}", exc_info=True)
+            logger.critical(f"UNHANDLED BOOT EXCEPTION: {e}", exc_info=True)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run_klaud())
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("System shutdown initiated by KLAUD-Ninja Operator.")
+        logger.info("KLAUD-NINJA shutdown by operator.")
