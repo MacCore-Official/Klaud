@@ -7,32 +7,48 @@ from typing import Dict, Any
 logger = logging.getLogger("Klaud.Gemini")
 
 class GeminiService:
+    """
+    KLAUD-NINJA NEURAL INTERFACE.
+    Handles Intent Parsing and Content Analysis.
+    """
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            logger.critical("GEMINI_API_KEY is missing!")
+            logger.error("AI Core: Missing API Key.")
             return
             
         genai.configure(api_key=api_key)
-        # Fix: Full path string for the 2026 production model
-        self.model = genai.GenerativeModel('models/gemini-1.5-flash')
-
-    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
-        instr = "Task: Extract intent. Return RAW JSON ONLY: {'action': 'create_channels', 'count': int, 'base_name': str}"
-        try:
-            res = await self.model.generate_content_async(f"{instr}\n\nUser: {prompt}")
-            return json.loads(res.text.strip().replace("```json", "").replace("```", ""))
-        except Exception as e:
-            logger.error(f"Intent Error: {e}")
-            return {"action": "none"}
+        # Fix: Using the strictly verified 2026 model path
+        self.model = genai.GenerativeModel('models/gemini-1.5-flash-latest')
 
     async def analyze_content(self, content: str, rules: str) -> Dict[str, Any]:
-        instr = f"Rules: {rules}\nReturn JSON: {{'violation': bool, 'reason': str, 'severity': 'low'|'medium'|'high'}}"
+        """Deep analysis for Moderation."""
+        prompt = (
+            f"SYSTEM: Moderator. RULES: {rules}\n"
+            "Analyze and return RAW JSON: {'violation': bool, 'reason': str, 'severity': 'low'|'medium'|'high'}"
+        )
         try:
-            res = await self.model.generate_content_async(f"{instr}\n\nContent: {content}")
-            return json.loads(res.text.strip().replace("```json", "").replace("```", ""))
+            # We use generation_config to force JSON response
+            response = await self.model.generate_content_async(
+                f"{prompt}\n\nContent: {content}",
+                generation_config={"response_mime_type": "application/json"}
+            )
+            return json.loads(response.text)
         except Exception as e:
-            logger.error(f"Analysis Error: {e}")
+            logger.error(f"AI Analysis Failure: {e}")
             return {"violation": False}
+
+    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
+        """Admin Command Translation."""
+        instr = "Return JSON: {'action': 'create_channels', 'count': int, 'base_name': str} or {'action': 'none'}"
+        try:
+            response = await self.model.generate_content_async(
+                f"{instr}\n\nUser: {prompt}",
+                generation_config={"response_mime_type": "application/json"}
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            logger.error(f"AI Intent Failure: {e}")
+            return {"action": "none"}
 
 gemini_ai = GeminiService()
