@@ -3,84 +3,71 @@ import os
 import json
 import logging
 import asyncio
-from typing import Dict, Any, Optional
 
 logger = logging.getLogger("Klaud.Neural")
 
 class GeminiService:
-    """
-    KLAUD-NINJA NEURAL PROCESSING UNIT.
-    Built for stable JSON-only output orchestration.
-    """
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY")
-        self.model_label = 'gemini-1.5-flash'
+        self.model_name = 'gemini-1.5-flash'
         self.model = None
-        self._initialize()
+        self._boot()
 
-    def _initialize(self):
+    def _boot(self):
         if not self.api_key:
-            logger.critical("NPU: Missing API Key.")
+            logger.critical("NPU: API KEY MISSING")
             return
 
-        try:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel(
-                model_name=self.model_label,
-                generation_config={
-                    "temperature": 0.1,
-                    "response_mime_type": "application/json",
-                }
-            )
-            logger.info(f"✅ NPU: Neural model {self.model_label} online.")
-        except Exception as e:
-            logger.error(f"❌ NPU: Init failure: {e}")
-
-    async def analyze_content(self, content: str, rules: str) -> Dict[str, Any]:
-        """Neural Moderation Scan."""
-        if not self.model: return {"violation": False}
-
-        prompt = (
-            f"Rules: {rules}\n"
-            "Analyze content. Return JSON: {'violation': bool, 'reason': str, 'severity': 'low'|'high'}"
-        )
+        genai.configure(api_key=self.api_key)
         
+        # We try the modern config first. 
+        # If the SDK is old, we catch the error during generation instead.
         try:
-            response = await asyncio.wait_for(
-                self.model.generate_content_async(f"{prompt}\n\nContent: {content}"),
-                timeout=12.0
+            self.model = genai.GenerativeModel(
+                model_name=self.model_name
             )
-            return self._sanitize(response.text)
-        except Exception:
-            return {"violation": False}
+            logger.info(f"✅ NPU: {self.model_name} initialized.")
+        except Exception as e:
+            logger.error(f"❌ NPU Boot Error: {e}")
 
-    async def parse_admin_intent(self, prompt: str) -> Dict[str, Any]:
-        """Admin Command Translator."""
+    async def parse_admin_intent(self, prompt: str):
         if not self.model: return {"action": "none"}
 
-        instr = (
-            "Schema: {'action': str, 'count': int, 'base_name': str}\n"
-            "Actions: ['create_channels', 'none']"
+        # We force JSON through the prompt as a backup for old SDK versions
+        system_instructions = (
+            "SYSTEM: Return ONLY valid JSON. No markdown, no conversation.\n"
+            "ACTIONS: 'create_channels', 'delete_channels', 'setup_server', 'none'\n"
+            "SCHEMA: {\"action\": string, \"count\": int, \"base_name\": string}\n"
         )
-        
+
         try:
-            response = await asyncio.wait_for(
-                self.model.generate_content_async(f"{instr}\n\nUser: {prompt}"),
-                timeout=12.0
+            # We move the generation_config inside the call for better compatibility
+            response = await self.model.generate_content_async(
+                f"{system_instructions}\n\nUSER REQUEST: {prompt}",
+                generation_config={
+                    "temperature": 0.1,
+                    # If the error persists, the code below handles it:
+                }
             )
-            return self._sanitize(response.text)
-        except Exception:
+            
+            return self._clean_json(response.text)
+        except Exception as e:
+            # Fallback if the SDK is strictly failing on parameters
+            logger.error(f"Neural Error: {e}")
             return {"action": "none"}
 
-    def _sanitize(self, raw_data: str) -> Dict[str, Any]:
-        """Ensures the AI output is a valid Python dictionary."""
+    def _clean_json(self, text):
+        """Force-cleans text into JSON if AI includes markdown wrappers."""
         try:
-            data = raw_data.strip()
-            if data.startswith("```"):
-                data = data.split("```")[1]
-                if data.startswith("json"): data = data[4:]
-            return json.loads(data)
+            cleaned = text.strip().replace("```json", "").replace("```", "")
+            return json.loads(cleaned)
         except:
-            return {}
+            # Manual fallback: look for the first '{' and last '}'
+            try:
+                start = text.find('{')
+                end = text.rfind('}') + 1
+                return json.loads(text[start:end])
+            except:
+                return {"action": "none"}
 
 gemini_ai = GeminiService()
