@@ -343,5 +343,5 @@ class LicensingCog(commands.Cog, name="Licensing"):
 
 
 async def setup(bot: KlaudBot) -> None:
+   async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(LicensingCog(bot))
-    bot.tree.add_command(LicensingCog.license_group)
