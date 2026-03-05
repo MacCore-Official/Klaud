@@ -9,65 +9,66 @@ logger = logging.getLogger("Klaud.Neural")
 class GeminiService:
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY")
-        self.model_name = 'gemini-1.5-flash'
+        # We use a stable model name that exists in all versions
+        self.model_label = 'gemini-1.5-flash'
         self.model = None
         self._boot()
 
     def _boot(self):
         if not self.api_key:
-            logger.critical("NPU: API KEY MISSING")
+            logger.critical("NPU: Missing API Key.")
             return
-
-        genai.configure(api_key=self.api_key)
-        
-        # We try the modern config first. 
-        # If the SDK is old, we catch the error during generation instead.
         try:
-            self.model = genai.GenerativeModel(
-                model_name=self.model_name
-            )
-            logger.info(f"✅ NPU: {self.model_name} initialized.")
+            genai.configure(api_key=self.api_key)
+            # Remove the GenerationConfig entirely to avoid the 'Unknown Field' crash
+            self.model = genai.GenerativeModel(self.model_label)
+            logger.info(f"✅ NPU: {self.model_label} online (Legacy Compatibility Mode).")
         except Exception as e:
-            logger.error(f"❌ NPU Boot Error: {e}")
+            logger.error(f"❌ NPU: Hardware failure: {e}")
 
     async def parse_admin_intent(self, prompt: str):
         if not self.model: return {"action": "none"}
 
-        # We force JSON through the prompt as a backup for old SDK versions
+        # We move the JSON instructions into the prompt itself.
+        # This is the 'Force-Fed' method. No config fields required.
         system_instructions = (
-            "SYSTEM: Return ONLY valid JSON. No markdown, no conversation.\n"
-            "ACTIONS: 'create_channels', 'delete_channels', 'setup_server', 'none'\n"
-            "SCHEMA: {\"action\": string, \"count\": int, \"base_name\": string}\n"
+            "You are the KLAUD-NINJA Admin AI. You must respond ONLY with raw JSON.\n"
+            "Do not talk. Do not explain. Just JSON.\n\n"
+            "ACTIONS:\n"
+            "- 'create_channels': (e.g., 'make a channel', 'new channel')\n"
+            "- 'delete_channels': (e.g., 'wipe server', 'delete everything')\n"
+            "- 'setup_server': (e.g., 'make a trading server')\n\n"
+            "SCHEMA: {\"action\": \"string\", \"count\": 1, \"base_name\": \"string\"}\n"
         )
 
         try:
-            # We move the generation_config inside the call for better compatibility
+            # We call this WITHOUT the generation_config that was breaking your bot
             response = await self.model.generate_content_async(
-                f"{system_instructions}\n\nUSER REQUEST: {prompt}",
-                generation_config={
-                    "temperature": 0.1,
-                    # If the error persists, the code below handles it:
-                }
+                f"{system_instructions}\n\nUSER REQUEST: {prompt}"
             )
             
-            return self._clean_json(response.text)
+            # Clean and parse
+            return self._manual_parse(response.text)
         except Exception as e:
-            # Fallback if the SDK is strictly failing on parameters
-            logger.error(f"Neural Error: {e}")
+            logger.error(f"NEURAL ERROR: {e}")
             return {"action": "none"}
 
-    def _clean_json(self, text):
-        """Force-cleans text into JSON if AI includes markdown wrappers."""
+    def _manual_parse(self, text):
+        """Extracts JSON even if the AI wraps it in markdown blocks."""
         try:
+            # Find the actual JSON content
             cleaned = text.strip().replace("```json", "").replace("```", "")
-            return json.loads(cleaned)
+            data = json.loads(cleaned)
+            logger.info(f"DETECTED ACTION: {data.get('action')}")
+            return data
         except:
-            # Manual fallback: look for the first '{' and last '}'
+            # Last ditch effort: regex-style search for braces
             try:
                 start = text.find('{')
                 end = text.rfind('}') + 1
                 return json.loads(text[start:end])
             except:
+                logger.warning("FAILED TO PARSE AI JSON.")
                 return {"action": "none"}
 
 gemini_ai = GeminiService()
