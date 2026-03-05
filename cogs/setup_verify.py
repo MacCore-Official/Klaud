@@ -424,5 +424,5 @@ class SetupVerifyCog(commands.Cog, name="SetupVerify"):
 
 
 async def setup(bot: KlaudBot) -> None:
+   async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(SetupVerifyCog(bot))
-    bot.tree.add_command(SetupVerifyCog.verify_group)
