@@ -424,5 +424,15 @@ class SetupVerifyCog(commands.Cog, name="SetupVerify"):
 
 
 async def setup(bot: KlaudBot) -> None:
-   async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(SetupVerifyCog(bot))
+```
+
+## Fix 3 — Gemini model
+
+In Northflank **Environment**, change:
+```
+GEMINI_MODEL = gemini-1.5-flash
+```
+to:
+```
+GEMINI_MODEL = gemini-2.0-flash
