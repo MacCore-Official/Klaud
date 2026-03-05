@@ -422,17 +422,5 @@ class SetupVerifyCog(commands.Cog, name="SetupVerify"):
         except Exception as e:
             logger.error(f"Failed to save verify settings: {e}")
 
-
 async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(SetupVerifyCog(bot))
-```
-
-## Fix 3 — Gemini model
-
-In Northflank **Environment**, change:
-```
-GEMINI_MODEL = gemini-1.5-flash
-```
-to:
-```
-GEMINI_MODEL = gemini-2.0-flash
