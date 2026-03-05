@@ -10,6 +10,7 @@ WORKDIR /app
 # Prevent Python from writing .pyc files and enable unbuffered stdout/stderr
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 
 # Install system dependencies required by asyncpg and cryptography
 RUN apt-get update && apt-get install -y --no-install-recommends \
