@@ -204,7 +204,7 @@ class DatabaseConnection:
                     min_size=self._pool_min,
                     max_size=self._pool_max,
                     command_timeout=30,
-                    statement_cache_size=100,
+                    statement_cache_size=0,
                 )
                 await self._init_postgres_schema()
                 self.mode = DatabaseMode.POSTGRES
