@@ -10,21 +10,17 @@ Tiers:        BASIC | PRO | ENTERPRISE
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import logging
 import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from database.connection import DatabaseConnection
 
 logger = logging.getLogger("klaud.license_manager")
-
-# ─── Data Models ─────────────────────────────────────────────────────────────
 
 VALID_TIERS = frozenset({"BASIC", "PRO", "ENTERPRISE"})
 KEY_PATTERN = re.compile(r"^KLAUD-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
@@ -32,8 +28,6 @@ KEY_PATTERN = re.compile(r"^KLAUD-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
 @dataclass
 class LicenseRecord:
-    """Represents a license row from the database."""
-
     id: int
     license_key: str
     server_id: Optional[int]
@@ -49,12 +43,7 @@ class LicenseRecord:
     def is_expired(self) -> bool:
         if self.expires_at is None:
             return False
-        now = datetime.now(tz=timezone.utc)
-        # Make expires_at tz-aware if it isn't
-        exp = self.expires_at
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        return now > exp
+        return datetime.utcnow() > self.expires_at.replace(tzinfo=None) if self.expires_at.tzinfo else datetime.utcnow() > self.expires_at
 
     @property
     def is_valid(self) -> bool:
@@ -63,12 +52,10 @@ class LicenseRecord:
 
 @dataclass
 class LicenseCacheEntry:
-    """TTL cache entry for license validation results."""
-
     valid: bool
     tier: str
     record: Optional[LicenseRecord]
-    cached_at: float  # time.monotonic()
+    cached_at: float
     ttl: float = 300.0
 
     @property
@@ -76,14 +63,7 @@ class LicenseCacheEntry:
         return (time.monotonic() - self.cached_at) > self.ttl
 
 
-# ─── Manager ─────────────────────────────────────────────────────────────────
-
 class LicenseManager:
-    """
-    Manages license creation, redemption, validation, and revocation.
-    Maintains a TTL cache to avoid hitting the database on every message.
-    """
-
     UNLICENSED_MESSAGE = (
         "⛔ **This server is not authorized to use Klaud.**\n"
         "Redeem a valid license key with `/license redeem <key>` to activate."
@@ -102,18 +82,10 @@ class LicenseManager:
         self._secret = license_secret or secrets.token_hex(32)
         self._cache_ttl = cache_ttl
         self._owner_test_server_id = owner_test_server_id
-
-        # guild_id → LicenseCacheEntry
         self._cache: dict[int, LicenseCacheEntry] = {}
         self._cache_lock = asyncio.Lock()
 
-    # ─── Public API ───────────────────────────────────────────────────────────
-
     async def is_licensed(self, guild_id: int) -> bool:
-        """
-        Fast path: returns True if the guild holds a valid, unexpired license.
-        Owner's test server always returns True.
-        """
         if self._owner_test_server_id and guild_id == self._owner_test_server_id:
             return True
 
@@ -128,7 +100,6 @@ class LicenseManager:
         return valid
 
     async def get_tier(self, guild_id: int) -> str:
-        """Return the license tier for a guild, or 'NONE' if unlicensed."""
         entry = await self._get_cache(guild_id)
         if entry and not entry.is_stale:
             return entry.tier if entry.valid else "NONE"
@@ -139,7 +110,6 @@ class LicenseManager:
         return "NONE"
 
     async def get_record(self, guild_id: int) -> Optional[LicenseRecord]:
-        """Return the full license record for a guild."""
         return await self._fetch_license(guild_id)
 
     async def redeem_key(
@@ -148,31 +118,15 @@ class LicenseManager:
         guild_id: int,
         redeemed_by: int,
     ) -> tuple[bool, str]:
-        """
-        Attempt to redeem a license key for a guild.
-        Returns (success, message).
-
-        Failure reasons:
-        - Key not found
-        - Key already redeemed
-        - Key expired
-        - Key not active
-        - Guild already has an active license
-        """
         key = key.strip().upper()
 
         if not KEY_PATTERN.match(key):
             return False, "❌ Invalid key format. Keys look like `KLAUD-XXXX-XXXX-XXXX`."
 
-        # Check if this guild already has a valid license
         existing = await self._fetch_license(guild_id)
         if existing and existing.is_valid:
-            return (
-                False,
-                f"❌ This server already has an active **{existing.tier}** license.",
-            )
+            return False, f"❌ This server already has an active **{existing.tier}** license."
 
-        # Fetch the key from DB
         row = await self._db.fetchrow(
             "SELECT * FROM licenses WHERE license_key = $1",
             key,
@@ -194,45 +148,29 @@ class LicenseManager:
             exp = row["expires_at"]
             if isinstance(exp, str):
                 exp = datetime.fromisoformat(exp)
-            if exp.tzinfo is None:
-                exp = exp.replace(tzinfo=timezone.utc)
-            if datetime.now(tz=timezone.utc) > exp:
+            exp_naive = exp.replace(tzinfo=None)
+            if datetime.utcnow() > exp_naive:
                 return False, "❌ This license key has expired."
 
-        # Bind the key to this guild
-        now = datetime.now(tz=timezone.utc)
-        if self._db.is_postgres():
-            await self._db.execute(
-                """
-                UPDATE licenses
-                SET server_id = $1, redeemed_at = $2, redeemed_by = $3
-                WHERE license_key = $4
-                """,
-                guild_id, now, redeemed_by, key,
-            )
-        else:
-            await self._db.execute(
-                """
-                UPDATE licenses
-                SET server_id = ?, redeemed_at = ?, redeemed_by = ?
-                WHERE license_key = ?
-                """,
-                guild_id, now.isoformat(), redeemed_by, key,
-                sqlite_query=(
-                    "UPDATE licenses "
-                    "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
-                    "WHERE license_key = ?"
-                ),
-            )
+        now = datetime.utcnow()
+        await self._db.execute(
+            """
+            UPDATE licenses
+            SET server_id = $1, redeemed_at = $2, redeemed_by = $3
+            WHERE license_key = $4
+            """,
+            guild_id, now, redeemed_by, key,
+            sqlite_query=(
+                "UPDATE licenses "
+                "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
+                "WHERE license_key = ?"
+            ),
+        )
 
-        # Invalidate cache
         await self._invalidate_cache(guild_id)
 
         tier = row["tier"]
-        return (
-            True,
-            f"✅ License redeemed! This server now has an active **{tier}** license.",
-        )
+        return True, f"✅ License redeemed! This server now has an active **{tier}** license."
 
     async def generate_key(
         self,
@@ -240,39 +178,23 @@ class LicenseManager:
         duration_days: Optional[int],
         created_by: int,
     ) -> str:
-        """
-        Generate a new license key and store it in the database.
-        Only callable by the bot owner.
-        """
         if tier.upper() not in VALID_TIERS:
             raise ValueError(f"Invalid tier '{tier}'. Must be one of: {', '.join(VALID_TIERS)}")
 
         key = self._generate_secure_key()
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.utcnow()
         expires_at: Optional[datetime] = None
 
         if duration_days is not None and duration_days > 0:
-            from datetime import timedelta
-            expires_at = now + timedelta(days=duration_days)
+            expires_at = datetime.utcnow() + timedelta(days=duration_days)
 
-        if self._db.is_postgres():
-            await self._db.execute(
-                """
-                INSERT INTO licenses (license_key, tier, owner_id, created_at, expires_at, active)
-                VALUES ($1, $2, $3, $4, $5, TRUE)
-                """,
-                key, tier.upper(), created_by, now, expires_at,
-            )
-        else:
-            await self._db.execute(
-                None,
-                key, tier.upper(), created_by, now.isoformat(),
-                expires_at.isoformat() if expires_at else None,
-                sqlite_query=(
-                    "INSERT INTO licenses (license_key, tier, owner_id, created_at, expires_at, active) "
-                    "VALUES (?, ?, ?, ?, ?, 1)"
-                ),
-            )
+        await self._db.execute(
+            """
+            INSERT INTO licenses (license_key, tier, owner_id, created_at, expires_at, active)
+            VALUES ($1, $2, $3, $4, $5, TRUE)
+            """,
+            key, tier.upper(), created_by, now, expires_at,
+        )
 
         logger.info(
             f"License generated | key={key} | tier={tier} | "
@@ -281,7 +203,6 @@ class LicenseManager:
         return key
 
     async def revoke_key(self, key: str) -> tuple[bool, str]:
-        """Revoke a license key by key string."""
         key = key.strip().upper()
 
         row = await self._db.fetchrow(
@@ -293,19 +214,12 @@ class LicenseManager:
         if not row:
             return False, "❌ Key not found."
 
-        if self._db.is_postgres():
-            await self._db.execute(
-                "UPDATE licenses SET active = FALSE WHERE license_key = $1",
-                key,
-            )
-        else:
-            await self._db.execute(
-                None,
-                key,
-                sqlite_query="UPDATE licenses SET active = 0 WHERE license_key = ?",
-            )
+        await self._db.execute(
+            "UPDATE licenses SET active = FALSE WHERE license_key = $1",
+            key,
+            sqlite_query="UPDATE licenses SET active = 0 WHERE license_key = ?",
+        )
 
-        # Invalidate cache for the bound server
         if row["server_id"]:
             await self._invalidate_cache(int(row["server_id"]))
 
@@ -313,18 +227,11 @@ class LicenseManager:
         return True, f"✅ License `{key}` has been revoked."
 
     async def disable_server(self, guild_id: int) -> tuple[bool, str]:
-        """Disable the license bound to a specific guild."""
-        if self._db.is_postgres():
-            result = await self._db.execute(
-                "UPDATE licenses SET active = FALSE WHERE server_id = $1 AND active = TRUE",
-                guild_id,
-            )
-        else:
-            result = await self._db.execute(
-                None,
-                guild_id,
-                sqlite_query="UPDATE licenses SET active = 0 WHERE server_id = ? AND active = 1",
-            )
+        result = await self._db.execute(
+            "UPDATE licenses SET active = FALSE WHERE server_id = $1 AND active = TRUE",
+            guild_id,
+            sqlite_query="UPDATE licenses SET active = 0 WHERE server_id = ? AND active = 1",
+        )
 
         await self._invalidate_cache(guild_id)
 
@@ -337,7 +244,6 @@ class LicenseManager:
         active_only: bool = True,
         limit: int = 20,
     ) -> list[dict]:
-        """List all licenses (owner-only)."""
         if self._db.is_postgres():
             query = (
                 "SELECT license_key, server_id, tier, active, expires_at, redeemed_at "
@@ -355,15 +261,8 @@ class LicenseManager:
             )
             return await self._db.fetch(query, limit, sqlite_query=query)
 
-    # ─── Internals ────────────────────────────────────────────────────────────
-
     def _generate_secure_key(self) -> str:
-        """
-        Generate a cryptographically secure license key.
-        Format: KLAUD-XXXX-XXXX-XXXX (alphanumeric, uppercase)
-        Uses secrets.token_bytes + HMAC for uniqueness guarantee.
-        """
-        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # No ambiguous chars
+        alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         parts = []
         for _ in range(3):
             segment = "".join(secrets.choice(alphabet) for _ in range(4))
@@ -371,7 +270,6 @@ class LicenseManager:
         return "KLAUD-" + "-".join(parts)
 
     async def _fetch_license(self, guild_id: int) -> Optional[LicenseRecord]:
-        """Fetch the active license record for a guild from the database."""
         try:
             if self._db.is_postgres():
                 row = await self._db.fetchrow(
@@ -403,20 +301,14 @@ class LicenseManager:
             return None
 
     def _row_to_record(self, row: dict) -> LicenseRecord:
-        """Convert a database row dict to a LicenseRecord."""
-
         def _parse_dt(val) -> Optional[datetime]:
             if val is None:
                 return None
             if isinstance(val, datetime):
-                if val.tzinfo is None:
-                    return val.replace(tzinfo=timezone.utc)
-                return val
+                return val.replace(tzinfo=None)
             if isinstance(val, str):
                 dt = datetime.fromisoformat(val)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
+                return dt.replace(tzinfo=None)
             return None
 
         return LicenseRecord(
@@ -425,7 +317,7 @@ class LicenseManager:
             server_id=row.get("server_id"),
             owner_id=row.get("owner_id"),
             tier=row.get("tier", "BASIC"),
-            created_at=_parse_dt(row.get("created_at")) or datetime.now(tz=timezone.utc),
+            created_at=_parse_dt(row.get("created_at")) or datetime.utcnow(),
             expires_at=_parse_dt(row.get("expires_at")),
             active=bool(row.get("active", False)),
             redeemed_at=_parse_dt(row.get("redeemed_at")),
@@ -457,7 +349,6 @@ class LicenseManager:
             self._cache.pop(guild_id, None)
 
     async def purge_expired_cache(self) -> int:
-        """Remove stale entries from the in-memory cache. Returns count removed."""
         async with self._cache_lock:
             stale = [gid for gid, e in self._cache.items() if e.is_stale]
             for gid in stale:
