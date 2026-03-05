@@ -422,5 +422,6 @@ class SetupVerifyCog(commands.Cog, name="SetupVerify"):
         except Exception as e:
             logger.error(f"Failed to save verify settings: {e}")
 
+
 async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(SetupVerifyCog(bot))
