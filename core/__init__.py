@@ -1,1 +1,0 @@
-# KLAUD-NINJA package
