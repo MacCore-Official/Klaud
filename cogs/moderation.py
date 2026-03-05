@@ -605,5 +605,5 @@ class ModerationCog(commands.Cog, name="Moderation"):
 
 
 async def setup(bot: KlaudBot) -> None:
+  async def setup(bot: KlaudBot) -> None:
     await bot.add_cog(ModerationCog(bot))
-    bot.tree.add_command(ModerationCog.mod_group)
