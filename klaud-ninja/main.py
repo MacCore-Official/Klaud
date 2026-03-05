@@ -10,7 +10,6 @@ import logging
 import sys
 from pathlib import Path
 
-# Ensure the bot package root is on sys.path regardless of how this is invoked
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config.settings import Settings
@@ -21,7 +20,6 @@ from utils.smart_logger import setup_logging
 async def main() -> None:
     settings = Settings()
 
-    # Initialise logging first so every subsequent log is captured
     setup_logging(level=settings.LOG_LEVEL, log_file=settings.LOG_FILE)
     logger = logging.getLogger("klaud.main")
 
