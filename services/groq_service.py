@@ -1,34 +1,23 @@
 """
-KLAUD-NINJA — Groq AI Service Layer
-================================================================================
-Replaces the Gemini service with Groq's ultra-fast LLM inference API.
-Groq runs models like Llama 3 and Mixtral at extremely low latency (~200ms),
-making it ideal for real-time Discord moderation where speed matters.
+KLAUD-NINJA — Groq AI Service
+═══════════════════════════════════════════════════════════════════════════════
+Replaces Gemini with Groq — fast, free, and reliable.
+Groq uses OpenAI-compatible chat completions API via the official groq SDK.
 
-Provider:  Groq Cloud  (https://console.groq.com)
-Models:    llama-3.3-70b-versatile (default, best quality)
-           llama-3.1-8b-instant    (fastest, good for high-traffic servers)
-           mixtral-8x7b-32768      (large context, good for admin commands)
-
-Auth:      Set GROQ_API_KEY environment variable
-           Get a free key at https://console.groq.com/keys
+Supported models (set via GROQ_MODEL env var):
+  llama-3.3-70b-versatile   — best quality, recommended
+  llama-3.1-8b-instant      — fastest, good for high-traffic
+  mixtral-8x7b-32768        — excellent at following structured instructions
+  gemma2-9b-it              — lightweight alternative
 
 Features:
-  - Structured JSON output via system prompt enforcement
-  - Exponential backoff retry with jitter
-  - Per-operation timeout enforcement
-  - Thread-safe async HTTP via aiohttp
-  - Detailed per-call telemetry and error tracking
-  - Automatic fallback to rule-based engine on any failure
-  - Model hot-swap without restart (via settings)
-  - Rate limit detection and automatic cooldown
-  - Request ID tracking for debugging
-  - Concurrent request limiting to avoid rate limits
-  - Full conversation context support for admin commands
-  - Streaming support for long responses (admin AI)
-  - Token usage tracking per call and cumulative
-  - Graceful degradation at every failure point
-================================================================================
+  • Async wrapper with thread executor (groq SDK is sync)
+  • Exponential backoff retry logic
+  • Structured JSON output parsing with validation
+  • Typed return dataclasses — no raw strings leak to callers
+  • Full fallback to rule-based engine if Groq is unavailable
+  • Service health stats for /mod status command
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
@@ -36,53 +25,26 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import re
 import time
-import uuid
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
-logger = logging.getLogger("klaud.groq")
+logger = logging.getLogger("klaud.groq_service")
 
-# ─── Constants ────────────────────────────────────────────────────────────────
+try:
+    from groq import Groq
+    HAS_GROQ = True
+except ImportError:
+    HAS_GROQ = False
+    logger.warning("groq package not installed — AI features will use fallback engine")
 
-GROQ_API_BASE = "https://api.groq.com/openai/v1"
-GROQ_CHAT_ENDPOINT = f"{GROQ_API_BASE}/chat/completions"
-GROQ_MODELS_ENDPOINT = f"{GROQ_API_BASE}/models"
 
-# Default model — best balance of speed and quality
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
-
-# Fallback models in priority order (used if primary fails)
-FALLBACK_MODELS = [
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-]
-
-# Per-model context window sizes (tokens)
-MODEL_CONTEXT_WINDOWS = {
-    "llama-3.3-70b-versatile":  128_000,
-    "llama-3.1-70b-versatile":  128_000,
-    "llama-3.1-8b-instant":     128_000,
-    "mixtral-8x7b-32768":        32_768,
-    "gemma2-9b-it":               8_192,
-    "gemma-7b-it":                8_192,
-}
-
-# Rate limit: Groq free tier allows ~30 req/min
-_REQUEST_SEMAPHORE_LIMIT = 10  # Max concurrent in-flight requests
-
-# ─── Output Models ────────────────────────────────────────────────────────────
-
+# ─── Output Models ───────────────────────────────────────────────────────────
 
 class ModerationAction(str, Enum):
-    """
-    Moderation action enum, in escalation order.
-    Each level implies all lower levels (e.g. BAN also deletes the message).
-    """
+    """All possible moderation actions in escalation order."""
     NONE    = "none"
     WARN    = "warn"
     DELETE  = "delete"
@@ -90,50 +52,20 @@ class ModerationAction(str, Enum):
     KICK    = "kick"
     BAN     = "ban"
 
-    @property
-    def severity(self) -> int:
-        """Numeric severity for comparison."""
-        return {
-            "none": 0, "warn": 1, "delete": 2,
-            "timeout": 3, "kick": 4, "ban": 5,
-        }[self.value]
-
-    @property
-    def implies_delete(self) -> bool:
-        """Whether this action should also delete the offending message."""
-        return self.severity >= 2
-
 
 @dataclass
 class ModerationDecision:
     """
-    Fully typed output from the AI moderation engine.
-    This is what cogs.moderation receives and acts upon.
-
-    Fields:
-        action          — What to do to the user
-        confidence      — AI's confidence 0.0–1.0 (higher = more certain)
-        categories      — List of violated policy categories
-        reason          — Human-readable explanation for the action
-        timeout_duration— Seconds to timeout the user (if action == TIMEOUT)
-        delete_message  — Whether to delete the triggering message
-        ai_generated    — False if this came from the fallback engine
-        request_id      — UUID for tracing this specific call
-        model_used      — Which AI model produced this decision
-        latency_ms      — How long the AI call took in milliseconds
-        tokens_used     — Total tokens consumed for this call
+    Structured output from the AI moderation analysis.
+    Always returned from analyze_message() — never None.
     """
-    action: ModerationAction            = ModerationAction.NONE
-    confidence: float                   = 0.0
-    categories: list[str]               = field(default_factory=list)
-    reason: str                         = ""
-    timeout_duration: int               = 600
-    delete_message: bool                = False
-    ai_generated: bool                  = True
-    request_id: str                     = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    model_used: str                     = ""
-    latency_ms: float                   = 0.0
-    tokens_used: int                    = 0
+    action:           ModerationAction = ModerationAction.NONE
+    confidence:       float            = 0.0
+    categories:       list[str]        = field(default_factory=list)
+    reason:           str              = ""
+    timeout_duration: int              = 600
+    delete_message:   bool             = False
+    ai_generated:     bool             = True
 
     @classmethod
     def safe_default(cls) -> "ModerationDecision":
@@ -145,415 +77,329 @@ class ModerationDecision:
         )
 
     @classmethod
-    def from_dict(cls, data: dict, model: str = "", latency: float = 0.0, tokens: int = 0) -> "ModerationDecision":
-        """Parse AI JSON response into a typed decision."""
-        action_str = str(data.get("action", "none")).lower().strip()
+    def from_dict(cls, data: dict) -> "ModerationDecision":
+        """Parse a Groq JSON response dict into a ModerationDecision."""
+        raw_action = str(data.get("action", "none")).lower().strip()
         try:
-            action = ModerationAction(action_str)
+            action = ModerationAction(raw_action)
         except ValueError:
-            logger.debug(f"Unknown action '{action_str}' — defaulting to none")
             action = ModerationAction.NONE
 
         confidence = float(data.get("confidence", 0.0))
-        confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+        confidence = max(0.0, min(1.0, confidence))   # Clamp to [0, 1]
 
         categories = data.get("categories", [])
-        if isinstance(categories, str):
-            categories = [categories]
-
-        timeout_raw = data.get("timeout_duration", 600)
-        try:
-            timeout_duration = int(timeout_raw)
-        except (TypeError, ValueError):
-            timeout_duration = 600
-        timeout_duration = max(60, min(timeout_duration, 2_419_200))  # 1min to 28 days
+        if not isinstance(categories, list):
+            categories = []
 
         return cls(
             action=action,
             confidence=confidence,
-            categories=[str(c) for c in categories if c],
+            categories=[str(c).lower() for c in categories],
             reason=str(data.get("reason", ""))[:500],
-            timeout_duration=timeout_duration,
-            delete_message=action.implies_delete,
+            timeout_duration=int(data.get("timeout_duration", 600)),
+            delete_message=action not in (ModerationAction.NONE, ModerationAction.WARN),
             ai_generated=True,
-            model_used=model,
-            latency_ms=latency,
-            tokens_used=tokens,
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"ModerationDecision(action={self.action.value}, "
+            f"confidence={self.confidence:.2f}, "
+            f"categories={self.categories})"
         )
 
 
 @dataclass
 class AdminCommandDecision:
     """
-    Fully typed output from the AI admin command parser.
-    This is what cogs.admin_ai receives and dispatches.
-
-    Fields:
-        action_type         — What Discord action to perform
-        parameters          — Dict of action-specific parameters
-        confirmation_required — Whether to ask admin to confirm first
-        explanation         — Human-readable description of the action
-        valid               — Whether the AI understood the command
-        request_id          — UUID for tracing
-        model_used          — Which model produced this
-        latency_ms          — How long the AI call took
-        tokens_used         — Token consumption
-        raw_instruction     — Original instruction for debugging
+    Structured output from the AI admin command parser.
+    Always returned from parse_admin_command() — never None.
     """
-    action_type: str                    = ""
-    parameters: dict[str, Any]          = field(default_factory=dict)
-    confirmation_required: bool         = False
-    explanation: str                    = ""
-    valid: bool                         = False
-    request_id: str                     = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    model_used: str                     = ""
-    latency_ms: float                   = 0.0
-    tokens_used: int                    = 0
-    raw_instruction: str                = ""
-
-    # Actions that are irreversible and should require confirmation
-    _RISKY_ACTIONS: frozenset = frozenset({
-        "delete_channel", "delete_category", "kick", "ban",
-        "set_permissions", "bulk_create_channels",
-    })
+    action_type:           str        = ""
+    parameters:            dict       = field(default_factory=dict)
+    confirmation_required: bool       = False
+    explanation:           str        = ""
+    valid:                 bool       = False
 
     @classmethod
     def invalid(cls, reason: str) -> "AdminCommandDecision":
-        """Return a failed decision with a user-facing reason."""
+        """Return an invalid decision with a human-readable reason."""
         return cls(valid=False, explanation=reason)
 
     @classmethod
-    def from_dict(
-        cls,
-        data: dict,
-        model: str = "",
-        latency: float = 0.0,
-        tokens: int = 0,
-        original: str = "",
-    ) -> "AdminCommandDecision":
-        """Parse AI JSON response into a typed admin decision."""
+    def from_dict(cls, data: dict) -> "AdminCommandDecision":
+        """Parse a Groq JSON response dict into an AdminCommandDecision."""
+        # Actions that always require confirmation
+        risky = {
+            "delete_channel", "delete_category", "delete_all_channels",
+            "set_permissions", "kick_user", "ban_user", "setup_basic_server",
+        }
         action = str(data.get("action_type", "")).strip()
-        params = data.get("parameters", {})
-        if not isinstance(params, dict):
-            params = {}
 
-        # Determine if this action requires confirmation
-        needs_confirm = (
-            action in cls._RISKY_ACTIONS
-            or bool(data.get("confirmation_required", False))
-        )
+        # For multi_action, carry the nested actions list in parameters
+        params = data.get("parameters", {})
+        if action == "multi_action":
+            params = {"actions": data.get("actions", [])}
 
         return cls(
             action_type=action,
             parameters=params,
-            confirmation_required=needs_confirm,
+            confirmation_required=(
+                bool(data.get("confirmation_required", False))
+                or action in risky
+            ),
             explanation=str(data.get("explanation", ""))[:500],
             valid=bool(action),
-            model_used=model,
-            latency_ms=latency,
-            tokens_used=tokens,
-            raw_instruction=original[:200],
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"AdminCommandDecision(action={self.action_type}, "
+            f"valid={self.valid}, confirm={self.confirmation_required})"
         )
 
 
-# ─── Telemetry ────────────────────────────────────────────────────────────────
+# ─── System Prompts ──────────────────────────────────────────────────────────
 
+_MODERATION_SYSTEM = """You are KLAUD, a strict Discord moderation AI.
+Analyze the given message and respond ONLY with a valid JSON object.
+No preamble, no markdown fences, no explanation — just the JSON.
 
-@dataclass
-class CallRecord:
-    """Single API call record for telemetry."""
-    operation:  str
-    model:      str
-    success:    bool
-    latency_ms: float
-    tokens:     int
-    error:      Optional[str]
-    timestamp:  float = field(default_factory=time.monotonic)
+Detectable violation categories:
+  toxicity, harassment, spam, scam, nsfw_text, threat, hate_speech,
+  profanity, caps_abuse, invite_link, raiding, self_harm_promotion
 
+Enforcement intensity levels:
+  LOW     — Only act on extreme violations: threats, hate speech, scams
+  MEDIUM  — Act on clear toxicity, harassment, spam, scams. Allow mild language
+  HIGH    — Act on profanity, caps abuse, invite links, any toxicity
+  EXTREME — Zero tolerance. Act on anything suspicious or borderline
 
-class ServiceTelemetry:
-    """
-    Rolling window telemetry for the Groq service.
-    Tracks the last N calls for health monitoring.
-    """
+Action escalation order: none < warn < delete < timeout < kick < ban
 
-    def __init__(self, window: int = 100) -> None:
-        self._records: deque[CallRecord] = deque(maxlen=window)
-        self._total_calls = 0
-        self._total_errors = 0
-        self._total_tokens = 0
-
-    def record(self, rec: CallRecord) -> None:
-        self._records.append(rec)
-        self._total_calls += 1
-        if not rec.success:
-            self._total_errors += 1
-        self._total_tokens += rec.tokens
-
-    def to_dict(self) -> dict:
-        recent = list(self._records)
-        if recent:
-            avg_latency = sum(r.latency_ms for r in recent) / len(recent)
-            recent_errors = sum(1 for r in recent if not r.success)
-            recent_error_rate = recent_errors / len(recent)
-        else:
-            avg_latency = 0.0
-            recent_error_rate = 0.0
-
-        return {
-            "total_calls":        self._total_calls,
-            "total_errors":       self._total_errors,
-            "total_tokens":       self._total_tokens,
-            "overall_error_rate": round(self._total_errors / max(self._total_calls, 1), 4),
-            "recent_error_rate":  round(recent_error_rate, 4),
-            "avg_latency_ms":     round(avg_latency, 1),
-            "window_size":        len(recent),
-        }
-
-
-# ─── System Prompts ───────────────────────────────────────────────────────────
-
-_MODERATION_SYSTEM = """
-You are KLAUD, an expert Discord server moderation AI.
-Your job is to analyze Discord messages and decide if they violate server rules.
-You MUST respond ONLY with a valid JSON object — no markdown, no explanation, no preamble.
-
-=== VIOLATION CATEGORIES ===
-toxicity       — General toxic, mean, or abusive language
-harassment     — Targeting a specific user with insults or abuse
-spam           — Repeated messages, excessive mentions, flooding
-scam           — Phishing links, fake giveaways, crypto scams, free Nitro tricks
-nsfw_text      — Sexual content, adult links, explicit descriptions
-threat         — Physical threats, doxxing threats, death threats
-hate_speech    — Slurs, discrimination based on race/gender/religion/sexuality
-profanity      — Excessive or severe swearing (context-dependent)
-caps_abuse     — Shouting in all-caps to harass or annoy
-invite_link    — Unauthorized Discord server invite links
-raiding        — Coordinated disruption, mass join + spam
-
-=== ENFORCEMENT INTENSITY ===
-LOW     → Only act on extreme violations: hate_speech, threat, scam. Ignore everything else.
-MEDIUM  → Act on: hate_speech, threat, scam, nsfw_text, harassment, spam. Allow mild profanity.
-HIGH    → Act on all categories. Strict enforcement. Even borderline content gets flagged.
-EXTREME → Zero tolerance. Flag anything suspicious. Escalate aggressively.
-
-=== AVAILABLE ACTIONS (escalation order) ===
-none    → No violation detected. Do nothing.
-warn    → Send the user a warning message.
-delete  → Delete the message silently.
-timeout → Temporarily mute the user (specify timeout_duration in seconds).
-kick    → Remove the user from the server (they can rejoin).
-ban     → Permanently ban the user.
-
-=== CONFIDENCE GUIDE ===
-0.95–1.0 → Absolutely certain (slurs, explicit threats, obvious scams)
-0.80–0.94 → Very confident (clear harassment, spam, scams)
-0.65–0.79 → Fairly confident (borderline content, context-dependent)
-0.50–0.64 → Uncertain (ambiguous, could go either way)
-Below 0.50 → Not a violation, return action: "none"
-
-=== OUTPUT FORMAT (JSON ONLY) ===
+Required JSON response format (no other text):
 {
   "action": "none|warn|delete|timeout|kick|ban",
   "confidence": 0.0,
-  "categories": ["category1"],
-  "reason": "Brief explanation of the violation and why this action was chosen",
+  "categories": [],
+  "reason": "brief explanation",
   "timeout_duration": 600
-}
+}"""
 
-Rules:
-- ONLY return JSON. Not a single character outside the JSON object.
-- If there is no violation, return {"action": "none", "confidence": 0.0, "categories": [], "reason": "No violation", "timeout_duration": 0}
-- timeout_duration is only meaningful when action is "timeout". Use seconds (600 = 10 minutes, 3600 = 1 hour, 86400 = 1 day).
-- Never set confidence above 1.0 or below 0.0.
-- reason should be 1–2 sentences maximum.
-"""
+_ADMIN_SYSTEM = """You are KLAUD, a Discord server management AI assistant.
+An admin has given you a natural language instruction.
+Convert it into a structured JSON action plan and respond ONLY with valid JSON.
+No preamble, no markdown fences, no explanation text — ONLY the JSON.
 
-_ADMIN_SYSTEM = """
-You are KLAUD, an intelligent Discord server management assistant.
-An admin has given you a natural language instruction. Parse their intent and return a structured action.
-You MUST respond ONLY with a valid JSON object — no markdown, no explanation, no preamble.
-
-=== SUPPORTED ACTIONS ===
+═══════════════════════════════════════════════════════
+SUPPORTED ACTION TYPES
+═══════════════════════════════════════════════════════
 
 create_category
-  Parameters: {"name": "Category Name"}
-  Example: "make a gaming category" → create_category with name "Gaming"
+  params: { "name": "Category Name" }
 
 create_channel
-  Parameters: {"name": "channel-name", "category": "Category Name or null", "type": "text|voice", "topic": "description or null"}
-  Example: "add a voice chat to General" → create_channel with type "voice"
+  params: { "name": "channel-name", "category": "Category Name or null", "type": "text|voice|announcement", "topic": "optional topic" }
 
 bulk_create_channels
-  Parameters: {"channels": [{"name": "ch1", "category": "Cat", "type": "text"}, ...]}
-  Use for "create multiple channels" requests. Max 10 channels.
+  params: { "channels": [ {"name": "ch1", "category": "Cat", "type": "text"}, ... ] }
+  Use this for ANY instruction creating 2+ channels at once.
 
 delete_channel
-  Parameters: {"channel_name": "channel-name"}
-  ALWAYS set confirmation_required: true
+  params: { "channel_name": "exact-channel-name" }
+
+delete_all_channels
+  params: { "confirm": true }
+  Use when admin says "delete all channels", "wipe all channels", "remove all channels", "clear all channels"
+
+delete_category
+  params: { "category_name": "Category Name", "delete_channels_inside": true }
 
 rename_channel
-  Parameters: {"old_name": "old-name", "new_name": "new-name"}
-
-set_permissions
-  Parameters: {"channel_name": "channel", "role_name": "role", "allow": ["read_messages"], "deny": ["send_messages"]}
-  Valid permissions: read_messages, send_messages, manage_messages, attach_files, embed_links, mention_everyone
-
-create_role
-  Parameters: {"name": "Role Name", "color": "#FF0000 or null", "permissions": ["send_messages"]}
-
-assign_role
-  Parameters: {"role_name": "Role Name", "user_mention": "@username"}
+  params: { "old_name": "old-name", "new_name": "new-name" }
 
 lock_channel
-  Parameters: {"channel_name": "channel-name"}
-  Prevents @everyone from sending messages.
+  params: { "channel_name": "channel-name" }
+  If admin says "lock this channel" or "lock current channel", use channel_name = "CURRENT"
 
 unlock_channel
-  Parameters: {"channel_name": "channel-name"}
+  params: { "channel_name": "channel-name" }
+
+set_permissions
+  params: { "channel_name": "channel-name", "role_name": "Role Name", "allow": ["send_messages"], "deny": [] }
+
+create_role
+  params: { "name": "Role Name", "color": "#hex or empty", "hoist": true/false, "mentionable": false }
+
+bulk_create_roles
+  params: { "roles": [ {"name": "Role1", "color": "#hex"}, ... ] }
+  Use when admin says "create roles for X, Y, Z"
+
+delete_role
+  params: { "role_name": "Role Name" }
+
+assign_role
+  params: { "role_name": "Role Name", "user_mention": "<@userid>" }
+
+purge_messages
+  params: { "amount": 10, "channel_name": "channel-name or CURRENT" }
+
+kick_user
+  params: { "user_mention": "<@userid>", "reason": "reason" }
+
+ban_user
+  params: { "user_mention": "<@userid>", "reason": "reason", "delete_days": 1 }
+
+timeout_user
+  params: { "user_mention": "<@userid>", "duration_minutes": 10, "reason": "reason" }
 
 setup_verification
-  Parameters: {"channel_name": "verify", "role_name": "Member"}
-  Creates a verification channel with a button. ENTERPRISE tier only.
+  params: { "channel_name": "verify", "role_name": "Verified" }
 
 setup_basic_server
-  Parameters: {}
-  Creates a standard server layout: Info/General/Staff categories with standard channels.
+  params: {}
 
-=== CHANNEL NAMING RULES ===
-- Always use lowercase-with-hyphens for channel names (e.g. "general-chat", "bot-commands")
-- Category names can be Title Case (e.g. "General", "Staff Only")
+unknown
+  params: { "reason": "why I cannot fulfil this" }
+  Use ONLY when the instruction is truly incomprehensible or impossible.
 
-=== OUTPUT FORMAT (JSON ONLY) ===
+═══════════════════════════════════════════════════════
+RESPONSE FORMAT — return ONE of these two shapes:
+═══════════════════════════════════════════════════════
+
+Single action:
 {
   "action_type": "action_name",
   "parameters": { ... },
-  "explanation": "What you're about to do, in plain English (1 sentence)",
+  "explanation": "one sentence: what will happen",
   "confirmation_required": false
 }
 
-Rules:
-- ONLY return JSON. Not a single character outside the JSON object.
-- Set confirmation_required: true for destructive actions (delete, kick, ban, set_permissions).
-- If you don't understand the instruction, return: {"action_type": "", "parameters": {}, "explanation": "I didn't understand that instruction. Please rephrase.", "confirmation_required": false}
-- Keep explanation short (1 sentence) and human-friendly.
-"""
+Multiple actions (when instruction requires several steps):
+{
+  "action_type": "multi_action",
+  "actions": [
+    { "action_type": "create_category", "parameters": { "name": "Trading" } },
+    { "action_type": "bulk_create_channels", "parameters": { "channels": [...] } }
+  ],
+  "explanation": "one sentence summary",
+  "confirmation_required": false
+}
 
-_GENERAL_SYSTEM = """
-You are KLAUD, a helpful Discord bot assistant. Answer concisely and helpfully.
-"""
+═══════════════════════════════════════════════════════
+EXAMPLES
+═══════════════════════════════════════════════════════
+
+Instruction: "delete all channels"
+Response: {"action_type":"delete_all_channels","parameters":{"confirm":true},"explanation":"Delete every channel in the server","confirmation_required":true}
+
+Instruction: "create a trading category with channels buy-sell, price-check, and middleman"
+Response: {"action_type":"multi_action","actions":[{"action_type":"create_category","parameters":{"name":"Trading"}},{"action_type":"bulk_create_channels","parameters":{"channels":[{"name":"buy-sell","category":"Trading","type":"text"},{"name":"price-check","category":"Trading","type":"text"},{"name":"middleman","category":"Trading","type":"text"}]}}],"explanation":"Create Trading category with 3 channels","confirmation_required":false}
+
+Instruction: "create roles for Admin, Moderator, VIP"
+Response: {"action_type":"bulk_create_roles","parameters":{"roles":[{"name":"Admin","color":"#FF0000"},{"name":"Moderator","color":"#FF8C00"},{"name":"VIP","color":"#FFD700"}]},"explanation":"Create 3 roles: Admin, Moderator, VIP","confirmation_required":false}
+
+Instruction: "lock this channel"
+Response: {"action_type":"lock_channel","parameters":{"channel_name":"CURRENT"},"explanation":"Lock the current channel so @everyone cannot send messages","confirmation_required":false}
+
+Instruction: "purge 50 messages"
+Response: {"action_type":"purge_messages","parameters":{"amount":50,"channel_name":"CURRENT"},"explanation":"Delete the last 50 messages in this channel","confirmation_required":true}
+
+Instruction: "make a giveaways channel under the events category"
+Response: {"action_type":"create_channel","parameters":{"name":"giveaways","category":"Events","type":"text","topic":"Server giveaways"},"explanation":"Create #giveaways text channel under Events category","confirmation_required":false}
+
+═══════════════════════════════════════════════════════
+RULES
+═══════════════════════════════════════════════════════
+- Channel names: lowercase with hyphens, no spaces, max 100 chars
+- confirmation_required = true ONLY for: delete_all_channels, delete_category, purge_messages (>10), kick, ban
+- Always fill in "explanation" — it shows to the admin before they confirm
+- NEVER return markdown fences, preamble, or any text outside the JSON
+- If admin mentions "this channel" or "current channel", use channel_name = "CURRENT"
+- Be smart: "make 3 gaming voice chats" → bulk_create_channels with 3 voice channels"""
 
 
-# ─── Main Service Class ───────────────────────────────────────────────────────
-
+# ─── Groq Service ────────────────────────────────────────────────────────────
 
 class GroqService:
     """
-    Async Groq API service for KLAUD-NINJA.
+    Async Groq AI service for KLAUD-NINJA.
 
-    Replaces the Gemini service with Groq's ultra-low-latency inference.
-    All methods return typed dataclasses and never raise exceptions —
-    failures are handled gracefully with fallback or error messages.
-
-    Usage:
-        service = GroqService(api_key="gsk_...", model_name="llama-3.3-70b-versatile")
-        await service.initialise()
-
-        decision = await service.analyze_message("you're so dumb", intensity="HIGH")
-        # → ModerationDecision(action=WARN, confidence=0.82, ...)
-
-        cmd = await service.parse_admin_command("create a memes channel")
-        # → AdminCommandDecision(action_type="create_channel", ...)
+    All methods return typed dataclasses.
+    Groq SDK is synchronous — all calls are wrapped in asyncio executor.
+    Retries with exponential backoff on failure.
+    Automatically falls back to rule-based engine when unavailable.
     """
 
     def __init__(
         self,
         api_key: str,
-        model_name: str = DEFAULT_MODEL,
-        timeout: float = 15.0,
+        model: str = "llama-3.3-70b-versatile",
+        timeout: float = 10.0,
         max_retries: int = 3,
     ) -> None:
-        self._api_key       = api_key
-        self._model_name    = model_name
-        self._timeout       = timeout
-        self._max_retries   = max_retries
-        self._available     = False
-        self._session: Any  = None  # aiohttp.ClientSession
-        self._semaphore     = asyncio.Semaphore(_REQUEST_SEMAPHORE_LIMIT)
-        self._telemetry     = ServiceTelemetry(window=200)
-        self._rate_limited_until: float = 0.0
+        self._api_key = api_key
+        self._model = model
+        self._timeout = timeout
+        self._max_retries = max_retries
+        self._client: Optional[Groq] = None
+        self._available = False
 
-        # Track which models are currently working
-        self._working_models: list[str] = []
-
-    # ─── Lifecycle ────────────────────────────────────────────────────────────
+        # Health tracking
+        self._total_calls = 0
+        self._total_errors = 0
+        self._last_error: Optional[str] = None
+        self._last_success_ts: Optional[float] = None
 
     async def initialise(self) -> None:
         """
-        Initialise the HTTP session and verify the API key works.
-        Call this once at bot startup from setup_hook().
+        Set up the Groq client and run a connectivity test.
+        Call once at bot startup. Sets self._available based on result.
         """
+        if not HAS_GROQ:
+            logger.warning("groq package not installed — AI features disabled")
+            return
+
         if not self._api_key:
-            logger.warning("GROQ_API_KEY not set — AI features disabled")
+            logger.warning("AI_API_KEY not set — AI features disabled")
             return
 
         try:
-            import aiohttp
-            self._session = aiohttp.ClientSession(
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type":  "application/json",
-                    "User-Agent":    "KLAUD-NINJA/2.0 (Discord Moderation Bot)",
-                },
-                timeout=aiohttp.ClientTimeout(total=self._timeout + 5),
+            self._client = Groq(api_key=self._api_key)
+
+            # Quick connectivity test — very short message
+            test_response = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._client.chat.completions.create(
+                        model=self._model,
+                        messages=[{"role": "user", "content": "Reply with: OK"}],
+                        max_tokens=5,
+                    ),
+                ),
+                timeout=8.0,
             )
 
-            # Test the connection with a trivial request
-            test_result = await self._chat_completion(
-                model=self._model_name,
-                messages=[
-                    {"role": "system", "content": "You are a test bot. Reply with exactly: ok"},
-                    {"role": "user",   "content": "ping"},
-                ],
-                max_tokens=5,
-                temperature=0.0,
-                operation="init_test",
-            )
-
-            if test_result is not None:
+            if test_response and test_response.choices:
                 self._available = True
-                self._working_models = [self._model_name]
+                self._last_success_ts = time.monotonic()
                 logger.info(
-                    f"Groq AI initialised | model={self._model_name} | "
-                    f"response_preview={repr(test_result[:30])}"
+                    f"Groq AI initialised ✓ | model={self._model} | "
+                    f"test_response='{test_response.choices[0].message.content.strip()}'"
                 )
             else:
-                logger.warning("Groq init test returned empty response — AI disabled")
+                logger.warning("Groq returned empty test response — running in degraded mode")
 
-        except ImportError:
-            logger.error("aiohttp not installed — Groq AI disabled. Run: pip install aiohttp")
-        except Exception as e:
-            logger.warning(f"Groq init failed: {e} — AI running in degraded mode (fallback only)")
-
-    async def close(self) -> None:
-        """Close the aiohttp session. Call this on bot shutdown."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            logger.debug("Groq HTTP session closed")
+        except asyncio.TimeoutError:
+            logger.warning("Groq connectivity test timed out — running in degraded mode")
+        except Exception as exc:
+            logger.warning(f"Groq init failed: {exc} — running in degraded mode")
 
     @property
     def available(self) -> bool:
-        """True if the service is ready to process requests."""
-        return (
-            self._available
-            and self._session is not None
-            and not self._session.closed
-            and time.monotonic() > self._rate_limited_until
-        )
-
-    @property
-    def model(self) -> str:
-        return self._model_name
+        """Return True if the Groq client is initialised and reachable."""
+        return self._available and self._client is not None
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
@@ -568,63 +414,49 @@ class GroqService:
         Analyze a Discord message for policy violations.
 
         Args:
-            content     — The raw message text to analyze
-            intensity   — Enforcement level: LOW / MEDIUM / HIGH / EXTREME
-            author_info — Optional context about the author (e.g. "new member, 2 prior warns")
-            channel_info— Optional context about the channel (e.g. "#general")
+            content:      The raw message text to analyze.
+            intensity:    Moderation intensity: LOW / MEDIUM / HIGH / EXTREME
+            author_info:  Optional author context string for the AI.
+            channel_info: Optional channel context string for the AI.
 
         Returns:
             ModerationDecision with action, confidence, categories, and reason.
-            Falls back to rule-based analysis if AI is unavailable.
+            Falls back to rule-based analysis if Groq is unavailable.
         """
         if not self.available:
             logger.debug("Groq unavailable — using fallback moderator")
             return self._fallback_moderate(content, intensity)
 
-        # Build the analysis prompt
-        prompt_parts = [
-            f"Enforcement Intensity: {intensity.upper()}",
+        # Build the user prompt with context
+        context_lines = [
+            f"Intensity level: {intensity.upper()}",
             f"Message to analyze: {content!r}",
         ]
         if author_info:
-            prompt_parts.append(f"Author context: {author_info}")
+            context_lines.append(f"Author context: {author_info}")
         if channel_info:
-            prompt_parts.append(f"Channel context: {channel_info}")
+            context_lines.append(f"Channel context: {channel_info}")
 
-        prompt = "\n".join(prompt_parts)
-        t_start = time.monotonic()
+        prompt = "\n".join(context_lines)
 
-        raw, tokens = await self._call_with_retry(
+        raw = await self._chat(
             system=_MODERATION_SYSTEM,
-            prompt=prompt,
-            operation="moderation",
+            user=prompt,
             max_tokens=256,
-            temperature=0.1,
+            operation="moderation",
         )
 
-        latency = (time.monotonic() - t_start) * 1000
-
         if raw is None:
-            logger.debug("Groq moderation returned None — using fallback")
+            logger.warning("Groq moderation returned None — using fallback")
             return self._fallback_moderate(content, intensity)
 
         try:
-            data = self._extract_json(raw)
-            decision = ModerationDecision.from_dict(
-                data,
-                model=self._model_name,
-                latency=latency,
-                tokens=tokens,
-            )
-            logger.debug(
-                f"Moderation result | action={decision.action.value} "
-                f"conf={decision.confidence:.2f} cats={decision.categories} "
-                f"latency={latency:.0f}ms tokens={tokens}"
-            )
+            data = self._parse_json(raw)
+            decision = ModerationDecision.from_dict(data)
+            logger.debug(f"Groq moderation: {decision}")
             return decision
-
-        except Exception as e:
-            logger.error(f"Failed to parse moderation response: {e} | raw={raw[:300]!r}")
+        except Exception as exc:
+            logger.error(f"Failed to parse moderation response: {exc} | raw={raw[:300]}")
             return self._fallback_moderate(content, intensity)
 
     async def parse_admin_command(
@@ -636,59 +468,42 @@ class GroqService:
         Parse a natural language admin instruction into a structured action.
 
         Args:
-            instruction   — The natural language command from the admin
-            guild_context — Optional context about the server structure
+            instruction:   The raw text from the admin's message.
+            guild_context: Optional string describing the server's current state.
 
         Returns:
-            AdminCommandDecision describing what action to perform.
-            Returns AdminCommandDecision.invalid() if parsing fails.
+            AdminCommandDecision. Returns .invalid() if parsing fails.
         """
         if not self.available:
             return AdminCommandDecision.invalid(
-                "AI service is currently unavailable. Try again in a moment."
+                "AI service is currently unavailable. Please try again in a moment."
             )
 
+        user_content = instruction
         if guild_context:
-            prompt = f"Server context:\n{guild_context}\n\nAdmin instruction: {instruction}"
-        else:
-            prompt = f"Admin instruction: {instruction}"
+            user_content = f"Server context:\n{guild_context}\n\nAdmin instruction:\n{instruction}"
 
-        t_start = time.monotonic()
-
-        raw, tokens = await self._call_with_retry(
+        raw = await self._chat(
             system=_ADMIN_SYSTEM,
-            prompt=prompt,
+            user=user_content,
+            max_tokens=1200,
             operation="admin_command",
-            max_tokens=512,
-            temperature=0.2,
         )
-
-        latency = (time.monotonic() - t_start) * 1000
 
         if raw is None:
             return AdminCommandDecision.invalid(
-                "AI did not respond. Please try again in a moment."
+                "AI did not respond. Please try again."
             )
 
         try:
-            data = self._extract_json(raw)
-            decision = AdminCommandDecision.from_dict(
-                data,
-                model=self._model_name,
-                latency=latency,
-                tokens=tokens,
-                original=instruction,
-            )
-            logger.debug(
-                f"Admin command parsed | action={decision.action_type} "
-                f"confirm={decision.confirmation_required} latency={latency:.0f}ms"
-            )
+            data = self._parse_json(raw)
+            decision = AdminCommandDecision.from_dict(data)
+            logger.debug(f"Groq admin command: {decision}")
             return decision
-
-        except Exception as e:
-            logger.error(f"Failed to parse admin command response: {e} | raw={raw[:300]!r}")
+        except Exception as exc:
+            logger.error(f"Failed to parse admin command response: {exc} | raw={raw[:300]}")
             return AdminCommandDecision.invalid(
-                "I couldn't parse that instruction. Please rephrase it more specifically."
+                "I couldn't understand that instruction. Please be more specific."
             )
 
     async def ask(
@@ -698,351 +513,169 @@ class GroqService:
         max_tokens: int = 512,
     ) -> Optional[str]:
         """
-        Free-form Groq query. Returns the raw text response or None.
-
-        Used internally and for any custom AI interactions in cogs.
+        Free-form Groq query. Returns raw text or None on failure.
+        For internal use — prefer the typed methods above.
         """
-        if not self.available:
-            return None
-
-        raw, _ = await self._call_with_retry(
-            system=system or _GENERAL_SYSTEM,
-            prompt=prompt,
-            operation="ask",
+        return await self._chat(
+            system=system or "You are KLAUD, a helpful Discord bot assistant.",
+            user=prompt,
             max_tokens=max_tokens,
-            temperature=0.7,
+            operation="ask",
         )
-        return raw
 
-    # ─── Core HTTP Caller ─────────────────────────────────────────────────────
+    # ─── Core caller ─────────────────────────────────────────────────────────
 
-    async def _call_with_retry(
+    async def _chat(
         self,
         system: str,
-        prompt: str,
-        operation: str,
+        user: str,
         max_tokens: int = 512,
-        temperature: float = 0.2,
-    ) -> tuple[Optional[str], int]:
+        operation: str = "unknown",
+    ) -> Optional[str]:
         """
-        Call the Groq API with exponential backoff + jitter retry.
+        Call the Groq API with retry and exponential backoff.
+
+        Args:
+            system:     System prompt.
+            user:       User message.
+            max_tokens: Max tokens in the response.
+            operation:  Label used in log messages.
 
         Returns:
-            (response_text or None, tokens_used)
+            The response text, or None if all retries exhausted.
         """
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": prompt},
-        ]
-
-        attempt  = 0
-        delay    = 1.0
-        last_err = None
+        attempt = 0
+        delay = 1.0
 
         while attempt < self._max_retries:
             attempt += 1
-            t0 = time.monotonic()
+            self._total_calls += 1
 
             try:
-                async with self._semaphore:
-                    result = await self._chat_completion(
-                        model=self._model_name,
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        operation=operation,
-                    )
+                response = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self._client.chat.completions.create(
+                            model=self._model,
+                            messages=[
+                                {"role": "system", "content": system},
+                                {"role": "user",   "content": user},
+                            ],
+                            max_tokens=max_tokens,
+                            temperature=0.1,    # Low temperature = consistent outputs
+                        ),
+                    ),
+                    timeout=self._timeout,
+                )
 
-                latency = (time.monotonic() - t0) * 1000
+                if response and response.choices and response.choices[0].message.content:
+                    text = response.choices[0].message.content.strip()
+                    self._last_success_ts = time.monotonic()
+                    return text
 
-                if result is not None:
-                    # Record success
-                    self._telemetry.record(CallRecord(
-                        operation=operation,
-                        model=self._model_name,
-                        success=True,
-                        latency_ms=latency,
-                        tokens=0,  # tokens tracked inside _chat_completion
-                        error=None,
-                    ))
-                    return result, 0
-
-                logger.warning(f"Groq empty response on {operation} attempt {attempt}")
+                logger.warning(
+                    f"[groq] Empty response on {operation} attempt {attempt}/{self._max_retries}"
+                )
 
             except asyncio.TimeoutError:
-                last_err = "timeout"
-                latency  = (time.monotonic() - t0) * 1000
-                self._telemetry.record(CallRecord(
-                    operation=operation,
-                    model=self._model_name,
-                    success=False,
-                    latency_ms=latency,
-                    tokens=0,
-                    error="timeout",
-                ))
+                self._total_errors += 1
+                self._last_error = "timeout"
                 logger.warning(
-                    f"Groq timeout on {operation} "
-                    f"(attempt {attempt}/{self._max_retries})"
+                    f"[groq] Timeout on {operation} "
+                    f"attempt {attempt}/{self._max_retries} ({self._timeout}s)"
                 )
 
-            except _RateLimitError as e:
-                # Back off for the rate limit window
-                cooldown = e.retry_after or 10.0
-                self._rate_limited_until = time.monotonic() + cooldown
-                logger.warning(f"Groq rate limited — cooling down for {cooldown:.1f}s")
-                self._telemetry.record(CallRecord(
-                    operation=operation,
-                    model=self._model_name,
-                    success=False,
-                    latency_ms=0,
-                    tokens=0,
-                    error=f"rate_limit:{cooldown}s",
-                ))
-                await asyncio.sleep(cooldown)
-                continue
-
-            except Exception as e:
-                last_err = str(e)
-                self._telemetry.record(CallRecord(
-                    operation=operation,
-                    model=self._model_name,
-                    success=False,
-                    latency_ms=(time.monotonic() - t0) * 1000,
-                    tokens=0,
-                    error=last_err,
-                ))
+            except Exception as exc:
+                self._total_errors += 1
+                self._last_error = str(exc)[:200]
                 logger.error(
-                    f"Groq error on {operation} "
-                    f"(attempt {attempt}/{self._max_retries}): {e}"
+                    f"[groq] Error on {operation} "
+                    f"attempt {attempt}/{self._max_retries}: {exc}"
                 )
-
-            # Exponential backoff with jitter
-            if attempt < self._max_retries:
-                jitter = random.uniform(0.0, 0.5)
-                wait   = min(delay + jitter, 15.0)
-                logger.debug(f"Retrying {operation} in {wait:.2f}s")
-                await asyncio.sleep(wait)
-                delay = min(delay * 2, 10.0)
-
-        logger.error(
-            f"Groq failed after {self._max_retries} attempts for {operation} "
-            f"| last_error={last_err}"
-        )
-        return None, 0
-
-    async def _chat_completion(
-        self,
-        model: str,
-        messages: list[dict],
-        max_tokens: int,
-        temperature: float,
-        operation: str,
-    ) -> Optional[str]:
-        """
-        Make a single Groq chat completion request.
-        Returns the text content or None.
-        Raises _RateLimitError on HTTP 429.
-        """
-        if self._session is None or self._session.closed:
-            logger.error("Groq HTTP session is not open")
-            return None
-
-        payload = {
-            "model":       model,
-            "messages":    messages,
-            "max_tokens":  max_tokens,
-            "temperature": temperature,
-            "stream":      False,
-        }
-
-        try:
-            async with self._session.post(
-                GROQ_CHAT_ENDPOINT,
-                json=payload,
-            ) as resp:
-
-                if resp.status == 429:
-                    # Extract retry-after if available
-                    retry_after_str = resp.headers.get("Retry-After", "10")
-                    try:
-                        retry_after = float(retry_after_str)
-                    except ValueError:
-                        retry_after = 10.0
-                    raise _RateLimitError(retry_after=retry_after)
-
-                if resp.status == 401:
-                    logger.error(
-                        "Groq API key is invalid (401 Unauthorized). "
-                        "Check your GROQ_API_KEY environment variable."
+                # If it's an auth error, no point retrying
+                err_str = str(exc).lower()
+                if "invalid_api_key" in err_str or "401" in err_str or "403" in err_str:
+                    logger.critical(
+                        "[groq] Authentication failed — check AI_API_KEY. "
+                        "Disabling AI for this session."
                     )
                     self._available = False
                     return None
 
-                if resp.status == 400:
-                    body = await resp.text()
-                    logger.error(f"Groq bad request (400): {body[:300]}")
-                    return None
+            # Exponential backoff before next retry
+            if attempt < self._max_retries:
+                backoff = min(delay * (2 ** (attempt - 1)), 8.0)
+                logger.debug(f"[groq] Retrying {operation} in {backoff:.1f}s...")
+                await asyncio.sleep(backoff)
 
-                if not resp.ok:
-                    body = await resp.text()
-                    logger.error(f"Groq HTTP {resp.status} on {operation}: {body[:200]}")
-                    return None
+        logger.error(
+            f"[groq] All {self._max_retries} retries exhausted for {operation}"
+        )
+        return None
 
-                data = await resp.json()
+    # ─── JSON parsing ────────────────────────────────────────────────────────
 
-                choices = data.get("choices", [])
-                if not choices:
-                    logger.warning(f"Groq returned no choices for {operation}")
-                    return None
-
-                message = choices[0].get("message", {})
-                content = message.get("content", "")
-
-                if not content:
-                    logger.warning(f"Groq returned empty content for {operation}")
-                    return None
-
-                return content.strip()
-
-        except _RateLimitError:
-            raise
-        except asyncio.TimeoutError:
-            raise
-        except Exception as e:
-            logger.error(f"Groq HTTP request failed for {operation}: {e}")
-            raise
-
-    # ─── JSON Extraction ──────────────────────────────────────────────────────
-
-    def _extract_json(self, text: str) -> dict:
+    def _parse_json(self, text: str) -> dict:
         """
-        Robustly extract a JSON object from Groq's response.
-
-        Handles:
-        - Clean JSON (most common with Llama/Mixtral)
-        - JSON wrapped in ```json ... ``` markdown fences
-        - JSON with leading/trailing whitespace
-        - JSON embedded in explanatory text
-        - Truncated JSON (best-effort recovery)
+        Extract and parse a JSON object from the AI response.
+        Handles common issues: markdown fences, leading/trailing text,
+        single quotes instead of double quotes.
         """
         text = text.strip()
 
-        # Strip markdown code fences
-        if "```" in text:
-            # Remove ```json or ``` fences
-            text = re.sub(r"```(?:json)?\s*", "", text)
-            text = re.sub(r"```\s*$", "", text)
-            text = text.strip()
+        # Strip markdown code fences: ```json ... ``` or ``` ... ```
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
 
-        # Try direct parse first (fastest path)
+        # Find the first { ... } block in case there's preamble text
+        brace_start = text.find("{")
+        brace_end   = text.rfind("}") + 1
+        if brace_start != -1 and brace_end > brace_start:
+            text = text[brace_start:brace_end]
+
+        # Try standard JSON parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Find the outermost {...} block
-        brace_start = text.find("{")
-        if brace_start == -1:
-            raise ValueError(f"No JSON object found in response: {text[:100]!r}")
-
-        # Find matching closing brace
-        depth = 0
-        brace_end = -1
-        for i, ch in enumerate(text[brace_start:], start=brace_start):
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    brace_end = i + 1
-                    break
-
-        if brace_end == -1:
-            # Try to close truncated JSON
-            candidate = text[brace_start:] + "}"
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                raise ValueError(f"Could not extract valid JSON from: {text[:200]!r}")
-
+        # Last resort: replace single quotes with double quotes (common LLM mistake)
         try:
-            return json.loads(text[brace_start:brace_end])
-        except json.JSONDecodeError as e:
-            raise ValueError(f"JSON parse error: {e} | text={text[brace_start:brace_end][:200]!r}")
+            fixed = text.replace("'", '"')
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            raise ValueError(f"Could not parse JSON from response: {text[:200]!r}")
 
-    # ─── Fallback ─────────────────────────────────────────────────────────────
+    # ─── Fallback ────────────────────────────────────────────────────────────
 
     def _fallback_moderate(self, content: str, intensity: str) -> ModerationDecision:
-        """
-        Rule-based moderation when Groq is unavailable.
-        Delegates to the FallbackModerator in ai_fallback.py.
-        """
+        """Use rule-based fallback when Groq is unavailable."""
         from services.ai_fallback import FallbackModerator
         return FallbackModerator.analyze(content, intensity)
 
-    # ─── Telemetry & Health ───────────────────────────────────────────────────
+    # ─── Stats ───────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        """Return comprehensive service health statistics."""
-        tel = self._telemetry.to_dict()
+        """Return service health statistics for /mod status."""
+        uptime_since = None
+        if self._last_success_ts:
+            elapsed = time.monotonic() - self._last_success_ts
+            uptime_since = f"{elapsed:.0f}s ago"
+
         return {
-            "provider":          "groq",
-            "available":         self.available,
-            "model":             self._model_name,
-            "rate_limited":      time.monotonic() < self._rate_limited_until,
-            "rate_limited_until": (
-                f"{self._rate_limited_until - time.monotonic():.1f}s"
-                if time.monotonic() < self._rate_limited_until else None
-            ),
-            **tel,
+            "available":      self.available,
+            "model":          self._model,
+            "total_calls":    self._total_calls,
+            "total_errors":   self._total_errors,
+            "error_rate":     round(self._total_errors / max(self._total_calls, 1), 3),
+            "last_error":     self._last_error,
+            "last_success":   uptime_since,
         }
 
-    async def list_available_models(self) -> list[str]:
-        """
-        Fetch the list of available models from Groq.
-        Returns an empty list on failure.
-        """
-        if not self._session or self._session.closed:
-            return []
-        try:
-            async with self._session.get(GROQ_MODELS_ENDPOINT) as resp:
-                if not resp.ok:
-                    return []
-                data = await resp.json()
-                return [m["id"] for m in data.get("data", [])]
-        except Exception as e:
-            logger.error(f"Failed to fetch Groq model list: {e}")
-            return []
-
-    def set_model(self, model_name: str) -> None:
-        """Hot-swap the active model without restarting the bot."""
-        old = self._model_name
-        self._model_name = model_name
-        logger.info(f"Groq model changed: {old} → {model_name}")
-
-    def reset_availability(self) -> None:
-        """
-        Manually reset the availability flag.
-        Useful if the service was disabled due to a transient error.
-        """
-        self._rate_limited_until = 0.0
-        if self._session and not self._session.closed and self._api_key:
-            self._available = True
-            logger.info("Groq service availability manually reset")
-
-
-# ─── Internal Exceptions ──────────────────────────────────────────────────────
-
-
-class _RateLimitError(Exception):
-    """Internal exception for HTTP 429 responses."""
-    def __init__(self, retry_after: float = 10.0) -> None:
-        self.retry_after = retry_after
-        super().__init__(f"Rate limited — retry after {retry_after}s")
-
-
-# ─── Backwards Compatibility Alias ────────────────────────────────────────────
-# The rest of the codebase imports GeminiService. This alias means zero changes
-# needed in core/bot.py, cogs/moderation.py, or cogs/admin_ai.py.
-
-GeminiService = GroqService
+    def __repr__(self) -> str:
+        return (
+            f"GroqService(model={self._model}, "
+            f"available={self._available}, "
+            f"calls={self._total_calls})"
+        )
