@@ -141,6 +141,9 @@ class AdminCommandDecision:
         params = data.get("parameters", {})
         if action == "multi_action":
             params = {"actions": data.get("actions", [])}
+        # For chat, carry the top-level message into parameters
+        if action == "chat":
+            params = {"message": data.get("message", data.get("explanation", ""))}
 
         return cls(
             action_type=action,
