@@ -1,811 +1,588 @@
 """
-KLAUD-NINJA — Admin AI Cog
-Natural language server management + conversational AI.
-@mention the bot to chat OR issue commands.
-PRO and ENTERPRISE tier only.
+KLAUD-NINJA — License Manager
+═══════════════════════════════════════════════════════════════════════════════
+Central authority for all license operations.
+No guild may use ANY bot feature without passing through this manager.
+
+Key format:  KLAUD-XXXX-XXXX-XXXX  (cryptographically secure, alphabet avoids
+             ambiguous characters like 0/O, 1/I)
+Tiers:       BASIC | PRO | ENTERPRISE
+
+Architecture:
+  • In-memory TTL cache per guild_id prevents DB hit on every message
+  • Cache is invalidated immediately on any license change
+  • All datetime operations use naive UTC to avoid timezone confusion
+  • Owner's test server always passes without a DB check
+═══════════════════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from datetime import timedelta
+import re
+import secrets
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import discord
-from discord.ext import commands
+from database.connection import DatabaseConnection
 
-from core.bot import KlaudBot
-from services.groq_service import AdminCommandDecision
+logger = logging.getLogger("klaud.license_manager")
 
-logger = logging.getLogger("klaud.admin_ai")
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-_REQUIRED_TIERS = frozenset({"PRO", "ENTERPRISE"})
+VALID_TIERS = frozenset({"BASIC", "PRO", "ENTERPRISE"})
 
-# Only these two need confirmation — everything else executes immediately
-_CONFIRM_ACTIONS = frozenset({"delete_all_channels", "setup_basic_server"})
+# Format: KLAUD-XXXX-XXXX-XXXX where X is alphanumeric (no ambiguous chars)
+KEY_PATTERN = re.compile(r"^KLAUD-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
 
-_API_DELAY = 0.5
+# Alphabet for key generation — avoids 0/O and 1/I confusion
+_KEY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-# ─── Confirmation View ────────────────────────────────────────────────────────
+# ─── Data Models ─────────────────────────────────────────────────────────────
 
-class ConfirmView(discord.ui.View):
-    def __init__(self, author_id: int) -> None:
-        super().__init__(timeout=30.0)
-        self.author_id = author_id
-        self.confirmed: Optional[bool] = None
+@dataclass
+class LicenseRecord:
+    """
+    Represents a fully-loaded license row from the database.
+    All datetimes are naive UTC.
+    """
+    id:          int
+    license_key: str
+    server_id:   Optional[int]
+    owner_id:    Optional[int]
+    tier:        str
+    created_at:  datetime
+    expires_at:  Optional[datetime]
+    active:      bool
+    redeemed_at: Optional[datetime]
+    redeemed_by: Optional[int]
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message("Only the invoking admin can confirm.", ephemeral=True)
+    @property
+    def is_expired(self) -> bool:
+        """True if the license has passed its expiry date."""
+        if self.expires_at is None:
             return False
-        return True
+        # Use naive UTC comparison — all datetimes stored as naive UTC
+        exp = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > exp
 
-    @discord.ui.button(label="✅ Confirm", style=discord.ButtonStyle.success)
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.confirmed = True
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(view=self)
-        self.stop()
-
-    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.danger)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        self.confirmed = False
-        for c in self.children: c.disabled = True
-        await interaction.response.edit_message(view=self)
-        self.stop()
-
-    async def on_timeout(self) -> None:
-        self.confirmed = False
-        self.stop()
-
-
-# ─── Cog ─────────────────────────────────────────────────────────────────────
-
-class AdminAICog(commands.Cog, name="AdminAI"):
-    def __init__(self, bot: KlaudBot) -> None:
-        self.bot = bot
-        logger.info("AdminAICog initialised")
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message) -> None:
-        if message.author.bot or not message.guild:
-            return
-        if self.bot.user not in message.mentions:
-            return
-
-        member = message.guild.get_member(message.author.id)
-        if not member or not member.guild_permissions.manage_guild:
-            return
-
-        if not await self.bot.license_manager.is_licensed(message.guild.id):
-            return
-
-        tier = await self.bot.license_manager.get_tier(message.guild.id)
-        if tier not in _REQUIRED_TIERS:
-            await _reply(message,
-                "⚠️ AI admin commands require **PRO** or **ENTERPRISE** license.\n"
-                "Use `/license info` to compare tiers.")
-            return
-
-        # Strip mention
-        content = message.content
-        for token in [f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"]:
-            content = content.replace(token, "").strip()
-
-        if not content:
-            await self._send_help(message)
-            return
-
-        async with message.channel.typing():
-            await self._process(message, content, tier)
-
-    # ─── Core pipeline ────────────────────────────────────────────────────────
-
-    async def _process(self, message: discord.Message, instruction: str, tier: str) -> None:
-        guild = message.guild
-        guild_context = (
-            f"Guild: {guild.name} ({guild.member_count} members)\n"
-            f"Categories: {[c.name for c in guild.categories[:15]]}\n"
-            f"Text channels: {[c.name for c in guild.text_channels[:20]]}\n"
-            f"Voice channels: {[c.name for c in guild.voice_channels[:10]]}\n"
-            f"Roles: {[r.name for r in guild.roles[:20] if not r.is_default()]}\n"
-            f"Bot's highest role: {guild.me.top_role.name}\n"
-            f"Current channel: {message.channel.name}"
+    @property
+    def is_valid(self) -> bool:
+        """True if the license is active, not expired, and bound to a server."""
+        return (
+            self.active
+            and not self.is_expired
+            and self.server_id is not None
         )
 
-        try:
-            decision = await asyncio.wait_for(
-                self.bot.groq.parse_admin_command(instruction, guild_context),
-                timeout=20.0,
+    @property
+    def days_remaining(self) -> Optional[int]:
+        """Returns days until expiry, or None for lifetime licenses."""
+        if self.expires_at is None:
+            return None
+        exp = self.expires_at if self.expires_at.tzinfo else self.expires_at.replace(tzinfo=timezone.utc)
+        delta = exp - datetime.now(timezone.utc)
+        return max(0, delta.days)
+
+    def __str__(self) -> str:
+        exp = f"expires {self.expires_at.date()}" if self.expires_at else "lifetime"
+        return f"LicenseRecord(key={self.license_key}, tier={self.tier}, {exp}, valid={self.is_valid})"
+
+
+@dataclass
+class LicenseCacheEntry:
+    """TTL-based in-memory cache entry for license validation results."""
+    valid:     bool
+    tier:      str
+    record:    Optional[LicenseRecord]
+    cached_at: float   # time.monotonic() timestamp
+    ttl:       float = 300.0
+
+    @property
+    def is_stale(self) -> bool:
+        """True if this cache entry has exceeded its TTL."""
+        return (time.monotonic() - self.cached_at) > self.ttl
+
+
+# ─── License Manager ─────────────────────────────────────────────────────────
+
+class LicenseManager:
+    """
+    Manages all license lifecycle: generation, redemption, validation,
+    revocation, disabling, and cache management.
+
+    Thread-safe: uses asyncio.Lock for cache access.
+    All public methods are async-safe and can be called from any cog.
+    """
+
+    UNLICENSED_MESSAGE = (
+        "⛔ **This server is not authorized to use Klaud.**\n"
+        "Redeem a valid license key with `/license redeem <key>` to activate.\n"
+        "Need a license? Contact the bot owner."
+    )
+
+    def __init__(
+        self,
+        db: DatabaseConnection,
+        owner_id: int,
+        license_secret: str,
+        cache_ttl: float = 300.0,
+        owner_test_server_id: Optional[int] = None,
+    ) -> None:
+        self._db = db
+        self._owner_id = owner_id
+        self._secret = license_secret or secrets.token_hex(32)
+        self._cache_ttl = cache_ttl
+        self._owner_test_server_id = owner_test_server_id
+
+        # guild_id → LicenseCacheEntry
+        self._cache: dict[int, LicenseCacheEntry] = {}
+        self._cache_lock = asyncio.Lock()
+
+    # ─── Primary validation ───────────────────────────────────────────────────
+
+    async def is_licensed(self, guild_id: int) -> bool:
+        """
+        Return True if the guild has a valid, unexpired license.
+
+        This is the hot path — called on every message event.
+        Results are cached for cache_ttl seconds to avoid DB hits.
+        Owner's test server always returns True without any DB check.
+        """
+        # Owner test server — always licensed
+        if self._owner_test_server_id and guild_id == self._owner_test_server_id:
+            return True
+
+        # Check memory cache first
+        entry = await self._get_cache(guild_id)
+        if entry is not None and not entry.is_stale:
+            return entry.valid
+
+        # Cache miss or stale — query the database
+        record = await self._fetch_license(guild_id)
+        valid = record is not None and record.is_valid
+        tier  = record.tier if record else "NONE"
+
+        await self._set_cache(guild_id, valid, tier, record)
+        return valid
+
+    async def get_tier(self, guild_id: int) -> str:
+        """
+        Return the license tier for a guild.
+        Returns 'NONE' if unlicensed or expired.
+        """
+        # Check cache
+        entry = await self._get_cache(guild_id)
+        if entry is not None and not entry.is_stale:
+            return entry.tier if entry.valid else "NONE"
+
+        record = await self._fetch_license(guild_id)
+        if record and record.is_valid:
+            await self._set_cache(guild_id, True, record.tier, record)
+            return record.tier
+
+        await self._set_cache(guild_id, False, "NONE", record)
+        return "NONE"
+
+    async def get_record(self, guild_id: int) -> Optional[LicenseRecord]:
+        """Return the full LicenseRecord for a guild, or None if not found."""
+        return await self._fetch_license(guild_id)
+
+    # ─── Key operations ───────────────────────────────────────────────────────
+
+    async def redeem_key(
+        self,
+        key: str,
+        guild_id: int,
+        redeemed_by: int,
+    ) -> tuple[bool, str]:
+        """
+        Attempt to redeem a license key for a guild.
+
+        Returns:
+            (True, success_message) on success.
+            (False, error_message) on failure.
+
+        Failure reasons:
+          - Invalid key format
+          - Key not found in DB
+          - Key already redeemed by this or another server
+          - Key disabled
+          - Key expired
+          - Guild already has an active license
+        """
+        key = key.strip().upper()
+
+        # Validate format
+        if not KEY_PATTERN.match(key):
+            return False, (
+                "❌ Invalid key format.\n"
+                "License keys look like: `KLAUD-XXXX-XXXX-XXXX`"
             )
-        except asyncio.TimeoutError:
-            await _reply(message, "⏱️ AI took too long. Try again.")
-            return
-        except Exception as exc:
-            logger.error(f"Admin AI error: {exc}", exc_info=True)
-            await _reply(message, "❌ Error processing your request.")
-            return
 
-        if not decision.valid or decision.action_type == "unknown":
-            await _reply(message, f"🤔 {decision.explanation or 'Could not understand that.'}")
-            return
+        # Check if guild already has an active license
+        existing = await self._fetch_license(guild_id)
+        if existing and existing.is_valid:
+            return False, (
+                f"❌ This server already has an active **{existing.tier}** license.\n"
+                "Use `/license status` to view it."
+            )
 
-        # Chat response — just reply naturally
-        if decision.action_type == "chat":
-            # AI returns message at top level: {"action_type":"chat","message":"..."}
-            # explanation field is used as fallback since from_dict stores it there
-            chat_msg = (
-                decision.parameters.get("message", "") if isinstance(decision.parameters, dict) else ""
-            ) or decision.explanation or ""
-            if not chat_msg:
-                chat_msg = "Hey! How can I help?"
-            await _reply(message, chat_msg)
-            return
-
-        # Confirmation only for truly destructive actions
-        needs_confirm = decision.action_type in _CONFIRM_ACTIONS
-        if needs_confirm:
-            confirmed = await self._confirm(message, decision)
-            if not confirmed:
-                await _reply(message, "❌ Cancelled.")
-                return
-
-        await self._execute(message, decision)
-
-    # ─── Confirmation ─────────────────────────────────────────────────────────
-
-    async def _confirm(self, message: discord.Message, decision: AdminCommandDecision) -> bool:
-        embed = discord.Embed(
-            title="⚠️ Are you sure?",
-            description=f"**{decision.explanation}**\n\nThis cannot be undone easily.",
-            color=discord.Color.orange(),
+        # Fetch the key from database
+        row = await self._db.fetchrow(
+            "SELECT * FROM licenses WHERE license_key = $1",
+            key,
+            sqlite_query="SELECT * FROM licenses WHERE license_key = ?",
         )
-        view  = ConfirmView(author_id=message.author.id)
-        reply = await _reply(message, embed=embed, view=view)
-        await view.wait()
-        if reply and hasattr(reply, "edit"):
-            try: await reply.edit(view=view)
-            except Exception: pass
-        return view.confirmed is True
 
-    # ─── Router ───────────────────────────────────────────────────────────────
+        if not row:
+            return False, "❌ License key not found. Please check for typos."
 
-    async def _execute(self, message: discord.Message, decision: AdminCommandDecision) -> None:
-        action = decision.action_type
-        params = decision.parameters
-        guild  = message.guild
+        # Check if already bound to a server
+        if row.get("server_id") is not None:
+            if int(row["server_id"]) == guild_id:
+                return False, "❌ This key is already bound to this server."
+            return False, "❌ This key has already been redeemed by another server."
 
-        router = {
-            "create_category":       self._create_category,
-            "create_channel":        self._create_channel,
-            "bulk_create_channels":  self._bulk_create_channels,
-            "delete_channel":        self._delete_channel,
-            "delete_all_channels":   self._delete_all_channels,
-            "delete_category":       self._delete_category,
-            "rename_channel":        self._rename_channel,
-            "lock_channel":          self._lock_channel,
-            "unlock_channel":        self._unlock_channel,
-            "set_channel_permissions": self._set_channel_permissions,
-            "set_permissions":       self._set_channel_permissions,  # legacy alias
-            "create_role":           self._create_role,
-            "bulk_create_roles":     self._bulk_create_roles,
-            "delete_role":           self._delete_role,
-            "edit_role_permissions": self._edit_role_permissions,
-            "move_role_to_top":      self._move_role_to_top,
-            "assign_role":           self._assign_role,
-            "remove_role":           self._remove_role,
-            "purge_messages":        self._purge_messages,
-            "kick_user":             self._kick_user,
-            "ban_user":              self._ban_user,
-            "unban_user":            self._unban_user,
-            "timeout_user":          self._timeout_user,
-            "untimeout_user":        self._untimeout_user,
-            "setup_verification":    self._setup_verification,
-            "setup_basic_server":    self._setup_basic_server,
-            "multi_action":          self._multi_action,
-        }
+        # Check if active
+        if not row.get("active"):
+            return False, "❌ This license key has been deactivated."
 
-        handler = router.get(action)
-        if not handler:
-            await _reply(message, f"🤔 I don't know how to do `{action}` yet.")
-            return
+        # Check expiry
+        if row.get("expires_at") is not None:
+            exp = row["expires_at"]
+            if isinstance(exp, str):
+                exp = datetime.fromisoformat(exp)
+            exp = exp if exp.tzinfo else exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp:
+                return False, "❌ This license key has expired."
+
+        # Bind the key to this guild
+        # First clear any existing binding for this guild (avoids UNIQUE constraint on server_id)
+        now = datetime.now(timezone.utc)
+        await self._db.execute(
+            "UPDATE licenses SET server_id = NULL WHERE server_id = $1 AND license_key != $2",
+            guild_id, key,
+            sqlite_query="UPDATE licenses SET server_id = NULL WHERE server_id = ? AND license_key != ?",
+        )
+        await self._db.execute(
+            """
+            UPDATE licenses
+            SET server_id = $1, redeemed_at = $2, redeemed_by = $3
+            WHERE license_key = $4
+            """,
+            guild_id, now.replace(tzinfo=None), redeemed_by, key,
+            sqlite_query=(
+                "UPDATE licenses "
+                "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
+                "WHERE license_key = ?"
+            ),
+        )
+
+        await self._invalidate_cache(guild_id)
+
+        tier = row.get("tier", "BASIC")
+        logger.info(
+            f"License redeemed | key={key} | guild={guild_id} | "
+            f"tier={tier} | by={redeemed_by}"
+        )
+        return True, f"✅ License redeemed! This server now has an active **{tier}** license."
+
+    async def generate_key(
+        self,
+        tier: str,
+        duration_days: Optional[int],
+        created_by: int,
+    ) -> str:
+        """
+        Generate a new license key and persist it to the database.
+        The key is NOT yet bound to any server — it must be redeemed.
+
+        Args:
+            tier:          BASIC | PRO | ENTERPRISE
+            duration_days: Days until expiry. None or 0 = lifetime.
+            created_by:    Discord user ID of the key creator (should be owner).
+
+        Returns:
+            The generated key string.
+
+        Raises:
+            ValueError if tier is invalid.
+        """
+        tier = tier.strip().upper()
+        if tier not in VALID_TIERS:
+            raise ValueError(
+                f"Invalid tier '{tier}'. "
+                f"Must be one of: {', '.join(sorted(VALID_TIERS))}"
+            )
+
+        key = self._generate_secure_key()
+        now = datetime.now(timezone.utc)
+        expires_at: Optional[datetime] = None
+
+        if duration_days is not None and duration_days > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(days=duration_days)
+
+        await self._db.execute(
+            """
+            INSERT INTO licenses (license_key, tier, owner_id, created_at, expires_at, active)
+            VALUES ($1, $2, $3, $4, $5, TRUE)
+            """,
+            key, tier, created_by, now.replace(tzinfo=None), expires_at.replace(tzinfo=None) if expires_at else None,
+            sqlite_query=(
+                "INSERT INTO licenses "
+                "(license_key, tier, owner_id, created_at, expires_at, active) "
+                "VALUES (?, ?, ?, ?, ?, 1)"
+            ),
+        )
+
+        exp_str = expires_at.date().isoformat() if expires_at else "never"
+        logger.info(
+            f"License generated | key={key} | tier={tier} | "
+            f"expires={exp_str} | by={created_by}"
+        )
+        return key
+
+    async def activate_server(
+        self,
+        guild_id: int,
+        tier: str,
+        duration_days: Optional[int],
+        activated_by: int,
+    ) -> tuple[bool, str, Optional[str]]:
+        """
+        Instantly activate a server without requiring key redemption.
+        Generates a key and immediately binds it to the server.
+
+        Returns:
+            (success, message, key_string_or_None)
+        """
+        # Check if already licensed
+        existing = await self._fetch_license(guild_id)
+        if existing and existing.is_valid:
+            return False, f"❌ Server `{guild_id}` already has an active **{existing.tier}** license.", None
 
         try:
-            await handler(message, guild, params)
-            await self._log_audit(guild, message.author.id, action, params, success=True)
-        except discord.Forbidden as e:
-            err = str(e).lower()
-            if "hierarchy" in err or "above" in err:
-                await _reply(message,
-                    "❌ I can't do that — the target's role is above mine.\n"
-                    "Go to **Server Settings → Roles** and drag the **KLAUD-NINJA** role to the top.")
-            else:
-                await _reply(message,
-                    "❌ Missing permissions. Make sure I have the right permissions enabled.")
-            logger.warning(f"Forbidden on {action}: {e}")
-        except Exception as exc:
-            logger.error(f"Action error ({action}): {exc}", exc_info=True)
-            await _reply(message, f"❌ Failed: {exc}")
+            key = await self.generate_key(
+                tier=tier,
+                duration_days=duration_days,
+                created_by=activated_by,
+            )
+        except ValueError as exc:
+            return False, f"❌ {exc}", None
 
-    # ─── Multi-action ──────────────────────────────────────────────────────────
+        # Directly bind it
+        now = datetime.now(timezone.utc)
+        await self._db.execute(
+            """
+            UPDATE licenses
+            SET server_id = $1, redeemed_at = $2, redeemed_by = $3
+            WHERE license_key = $4
+            """,
+            guild_id, now.replace(tzinfo=None), activated_by, key,
+            sqlite_query=(
+                "UPDATE licenses "
+                "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
+                "WHERE license_key = ?"
+            ),
+        )
 
-    async def _multi_action(self, message, guild: discord.Guild, params: dict) -> None:
-        actions = params.get("actions", [])
-        if not actions:
-            await _reply(message, "❌ No actions in plan.")
-            return
-        status  = await _reply(message, f"⚙️ Executing {len(actions)} action(s)...")
-        results = []
-        router  = {
-            "create_category":       self._create_category,
-            "create_channel":        self._create_channel,
-            "bulk_create_channels":  self._bulk_create_channels,
-            "delete_channel":        self._delete_channel,
-            "delete_all_channels":   self._delete_all_channels,
-            "delete_category":       self._delete_category,
-            "rename_channel":        self._rename_channel,
-            "create_role":           self._create_role,
-            "bulk_create_roles":     self._bulk_create_roles,
-            "edit_role_permissions": self._edit_role_permissions,
-            "move_role_to_top":      self._move_role_to_top,
-            "lock_channel":          self._lock_channel,
-            "unlock_channel":        self._unlock_channel,
-            "set_channel_permissions": self._set_channel_permissions,
-            "set_permissions":       self._set_channel_permissions,
-            "assign_role":           self._assign_role,
-            "remove_role":           self._remove_role,
-            "purge_messages":        self._purge_messages,
-            "kick_user":             self._kick_user,
-            "ban_user":              self._ban_user,
-            "timeout_user":          self._timeout_user,
-            "delete_role":           self._delete_role,
-        }
-        for step in actions:
-            at = step.get("action_type", "")
-            sp = step.get("parameters", {})
-            h  = router.get(at)
-            if h:
-                try:
-                    col = _ResultCollector()
-                    await h(col, guild, sp)
-                    results.append(f"✅ {at}: {col.last or 'done'}")
-                except discord.Forbidden:
-                    results.append(f"❌ {at}: missing permissions (check role hierarchy)")
-                except Exception as exc:
-                    results.append(f"❌ {at}: {exc}")
-            else:
-                results.append(f"⚠️ Unknown: {at}")
-            await asyncio.sleep(_API_DELAY)
+        await self._invalidate_cache(guild_id)
 
-        result = f"✅ **Done!**\n" + "\n".join(results)
-        if status and hasattr(status, "edit"):
-            try: await status.edit(content=result); return
-            except Exception: pass
-        await _reply(message, result)
+        logger.info(
+            f"Server auto-activated | guild={guild_id} | tier={tier} | "
+            f"key={key} | by={activated_by}"
+        )
+        return True, f"✅ Server `{guild_id}` activated with **{tier}** license.", key
 
-    # ─── Channel handlers ──────────────────────────────────────────────────────
+    async def revoke_key(self, key: str) -> tuple[bool, str]:
+        """Revoke a license key by its key string. Disables it immediately."""
+        key = key.strip().upper()
 
-    async def _create_category(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("name", "New Category")
-        if discord.utils.get(guild.categories, name=name):
-            await _reply(message, f"⏭️ Category **{name}** already exists.")
-            return
-        cat = await guild.create_category(name)
-        await _reply(message, f"✅ Created category **{cat.name}**")
+        row = await self._db.fetchrow(
+            "SELECT * FROM licenses WHERE license_key = $1",
+            key,
+            sqlite_query="SELECT * FROM licenses WHERE license_key = ?",
+        )
 
-    async def _create_channel(self, message, guild: discord.Guild, params: dict) -> None:
-        name     = str(params.get("name", "new-channel")).lower().replace(" ", "-")
-        cat_name = params.get("category")
-        ch_type  = str(params.get("type", "text")).lower()
-        topic    = str(params.get("topic", ""))
-        category = None
-        if cat_name:
-            category = discord.utils.get(guild.categories, name=cat_name)
-            if not category:
-                category = await guild.create_category(cat_name)
-        if ch_type == "voice":
-            ch = await guild.create_voice_channel(name=name, category=category)
-            await _reply(message, f"✅ Created voice channel **{ch.name}**")
+        if not row:
+            return False, "❌ Key not found."
+
+        await self._db.execute(
+            "UPDATE licenses SET active = FALSE WHERE license_key = $1",
+            key,
+            sqlite_query="UPDATE licenses SET active = 0 WHERE license_key = ?",
+        )
+
+        if row.get("server_id"):
+            await self._invalidate_cache(int(row["server_id"]))
+
+        logger.info(f"License revoked | key={key}")
+        return True, f"✅ License `{key}` has been revoked."
+
+    async def disable_server(self, guild_id: int) -> tuple[bool, str]:
+        """Disable all active licenses for a specific server."""
+        result = await self._db.execute(
+            "UPDATE licenses SET active = FALSE WHERE server_id = $1 AND active = TRUE",
+            guild_id,
+            sqlite_query="UPDATE licenses SET active = 0 WHERE server_id = ? AND active = 1",
+        )
+
+        await self._invalidate_cache(guild_id)
+
+        if result and result not in ("UPDATE 0", "OK"):
+            return True, f"✅ License for server `{guild_id}` has been disabled."
+        # For SQLite 'OK' always returned — check differently
+        if self._db.is_sqlite():
+            return True, f"✅ Attempted to disable license for server `{guild_id}`."
+        return False, "❌ No active license found for that server."
+
+    async def list_licenses(
+        self,
+        active_only: bool = True,
+        limit: int = 20,
+    ) -> list[dict]:
+        """
+        List licenses from the database.
+        Owner-only operation.
+        """
+        if self._db.is_postgres():
+            where = "WHERE active = TRUE " if active_only else ""
+            query = (
+                "SELECT license_key, server_id, tier, active, expires_at, redeemed_at, created_at "
+                f"FROM licenses {where}"
+                "ORDER BY created_at DESC LIMIT $1"
+            )
+            return await self._db.fetch(query, limit)
         else:
-            ch = await guild.create_text_channel(name=name, category=category, topic=topic[:1024] or None)
-            await _reply(message, f"✅ Created channel {ch.mention}")
+            where = "WHERE active = 1 " if active_only else ""
+            query = (
+                "SELECT license_key, server_id, tier, active, expires_at, redeemed_at, created_at "
+                f"FROM licenses {where}"
+                "ORDER BY created_at DESC LIMIT ?"
+            )
+            return await self._db.fetch(query, limit, sqlite_query=query)
 
-    async def _bulk_create_channels(self, message, guild: discord.Guild, params: dict) -> None:
-        channels = params.get("channels", [])[:15]
-        if not channels:
-            await _reply(message, "❌ No channels specified.")
-            return
-        created, skipped, failed = [], [], []
-        for spec in channels:
-            name     = str(spec.get("name", "channel")).lower().replace(" ", "-")
-            cat_name = spec.get("category")
-            ch_type  = str(spec.get("type", "text")).lower()
-            if (discord.utils.get(guild.text_channels, name=name) or
-                    discord.utils.get(guild.voice_channels, name=name)):
-                skipped.append(name); continue
-            try:
-                category = None
-                if cat_name:
-                    category = discord.utils.get(guild.categories, name=cat_name)
-                    if not category:
-                        category = await guild.create_category(cat_name)
-                        await asyncio.sleep(_API_DELAY)
-                if ch_type == "voice":
-                    ch = await guild.create_voice_channel(name=name, category=category)
-                else:
-                    ch = await guild.create_text_channel(name=name, category=category)
-                created.append(ch.mention if hasattr(ch, "mention") else f"#{name}")
-                await asyncio.sleep(_API_DELAY)
-            except Exception as exc:
-                failed.append(f"{name}: {exc}")
-        parts = []
-        if created: parts.append(f"✅ Created {len(created)}: {', '.join(created)}")
-        if skipped: parts.append(f"⏭️ Existed: {', '.join(skipped)}")
-        if failed:  parts.append(f"❌ Failed: {', '.join(failed)}")
-        await _reply(message, "\n".join(parts) or "Nothing to do.")
+    # ─── Cache management ─────────────────────────────────────────────────────
 
-    async def _delete_channel(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("channel_name", "")
-        ch   = (discord.utils.get(guild.channels, name=name) or
-                next((c for c in guild.channels if c.name.lower() == name.lower()), None))
-        if not ch:
-            await _reply(message, f"❌ Channel `{name}` not found.")
-            return
-        await ch.delete(reason=f"KLAUD AI — {_author(message)}")
-        await _reply(message, f"🗑️ Deleted `#{name}`")
+    async def purge_expired_cache(self) -> int:
+        """Remove stale entries from the in-memory cache. Returns count removed."""
+        async with self._cache_lock:
+            stale_ids = [gid for gid, e in self._cache.items() if e.is_stale]
+            for gid in stale_ids:
+                del self._cache[gid]
+            return len(stale_ids)
 
-    async def _delete_all_channels(self, message, guild: discord.Guild, params: dict) -> None:
-        current = getattr(message, "channel", None)
-        to_del  = [c for c in guild.channels if c != current]
-        status  = await _reply(message, f"⚙️ Deleting {len(to_del)} channels...")
-        deleted = failed = 0
-        for ch in to_del:
-            try:
-                await ch.delete(reason=f"KLAUD AI bulk delete — {_author(message)}")
-                deleted += 1
-                await asyncio.sleep(_API_DELAY)
-            except discord.HTTPException:
-                failed += 1
-        result = f"🗑️ Deleted **{deleted}** channel(s)."
-        if failed: result += f" {failed} protected/system channels skipped."
-        if status and hasattr(status, "edit"):
-            try: await status.edit(content=result); return
-            except Exception: pass
-        await _reply(message, result)
+    async def force_refresh(self, guild_id: int) -> None:
+        """Force the cache to refresh for a specific guild on next access."""
+        await self._invalidate_cache(guild_id)
 
-    async def _delete_category(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("category_name", "")
-        cat  = discord.utils.get(guild.categories, name=name)
-        if not cat:
-            await _reply(message, f"❌ Category `{name}` not found.")
-            return
-        if params.get("delete_channels_inside", True):
-            for ch in list(cat.channels):
-                try: await ch.delete(); await asyncio.sleep(_API_DELAY)
-                except Exception: pass
-        await cat.delete()
-        await _reply(message, f"🗑️ Deleted category **{name}**")
+    # ─── Private helpers ──────────────────────────────────────────────────────
 
-    async def _rename_channel(self, message, guild: discord.Guild, params: dict) -> None:
-        old = params.get("old_name", "")
-        new = str(params.get("new_name", "")).lower().replace(" ", "-")
-        ch  = (discord.utils.get(guild.channels, name=old) or
-               next((c for c in guild.channels if c.name.lower() == old.lower()), None))
-        if not ch:
-            await _reply(message, f"❌ Channel `{old}` not found.")
-            return
-        await ch.edit(name=new)
-        await _reply(message, f"✅ Renamed **#{old}** → **#{new}**")
+    def _generate_secure_key(self) -> str:
+        """
+        Generate a cryptographically secure license key.
+        Format: KLAUD-XXXX-XXXX-XXXX
+        Uses secrets.choice for cryptographic randomness.
+        """
+        parts = [
+            "".join(secrets.choice(_KEY_ALPHABET) for _ in range(4))
+            for _ in range(3)
+        ]
+        return "KLAUD-" + "-".join(parts)
 
-    async def _lock_channel(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("channel_name", "CURRENT")
-        ch   = (getattr(message, "channel", None) if name == "CURRENT"
-                else discord.utils.get(guild.text_channels, name=name))
-        if not ch: await _reply(message, f"❌ Channel `{name}` not found."); return
-        ow = ch.overwrites_for(guild.default_role)
-        ow.send_messages = False
-        await ch.set_permissions(guild.default_role, overwrite=ow)
-        try: await ch.send("🔒 This channel has been locked.")
-        except Exception: pass
-        await _reply(message, f"🔒 Locked {ch.mention}")
-
-    async def _unlock_channel(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("channel_name", "CURRENT")
-        ch   = (getattr(message, "channel", None) if name == "CURRENT"
-                else discord.utils.get(guild.text_channels, name=name))
-        if not ch: await _reply(message, f"❌ Channel `{name}` not found."); return
-        ow = ch.overwrites_for(guild.default_role)
-        ow.send_messages = None
-        await ch.set_permissions(guild.default_role, overwrite=ow)
-        try: await ch.send("🔓 This channel has been unlocked.")
-        except Exception: pass
-        await _reply(message, f"🔓 Unlocked {ch.mention}")
-
-    async def _set_channel_permissions(self, message, guild: discord.Guild, params: dict) -> None:
-        ch_name   = params.get("channel_name", "")
-        role_name = params.get("role_name", "")
-        ch   = discord.utils.get(guild.text_channels, name=ch_name)
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not ch:   await _reply(message, f"❌ Channel `{ch_name}` not found."); return
-        if not role: await _reply(message, f"❌ Role `{role_name}` not found."); return
-        ow = discord.PermissionOverwrite()
-        for p in params.get("allow", []):
-            try: setattr(ow, p, True)
-            except AttributeError: pass
-        for p in params.get("deny", []):
-            try: setattr(ow, p, False)
-            except AttributeError: pass
-        await ch.set_permissions(role, overwrite=ow)
-        await _reply(message, f"✅ Updated channel permissions for **{role.name}** in {ch.mention}")
-
-    # ─── Role handlers ─────────────────────────────────────────────────────────
-
-    async def _create_role(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("name", "New Role")
-        if discord.utils.get(guild.roles, name=name):
-            await _reply(message, f"⏭️ Role **{name}** already exists.")
-            return
-        color = discord.Color.default()
-        if params.get("color"):
-            try: color = discord.Color(int(str(params["color"]).lstrip("#"), 16))
-            except (ValueError, AttributeError): pass
-        role = await guild.create_role(
-            name=name, color=color,
-            hoist=bool(params.get("hoist", False)),
-            mentionable=bool(params.get("mentionable", False)),
-        )
-        await _reply(message, f"✅ Created role **{role.name}**")
-
-    async def _bulk_create_roles(self, message, guild: discord.Guild, params: dict) -> None:
-        roles = params.get("roles", [])[:20]
-        if not roles: await _reply(message, "❌ No roles specified."); return
-        created, skipped = [], []
-        for spec in roles:
-            name = spec.get("name", "Role")
-            if discord.utils.get(guild.roles, name=name):
-                skipped.append(name); continue
-            try:
-                color = discord.Color.default()
-                if spec.get("color"):
-                    try: color = discord.Color(int(str(spec["color"]).lstrip("#"), 16))
-                    except (ValueError, AttributeError): pass
-                r = await guild.create_role(
-                    name=name, color=color,
-                    hoist=bool(spec.get("hoist", False)),
-                    mentionable=bool(spec.get("mentionable", False)),
+    async def _fetch_license(self, guild_id: int) -> Optional[LicenseRecord]:
+        """Fetch the most recent license record for a guild from the database."""
+        try:
+            if self._db.is_postgres():
+                row = await self._db.fetchrow(
+                    """
+                    SELECT * FROM licenses
+                    WHERE server_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    guild_id,
                 )
-                created.append(r.name)
-                await asyncio.sleep(_API_DELAY)
-            except Exception as exc:
-                logger.warning(f"create_role {name}: {exc}")
-        parts = []
-        if created: parts.append(f"✅ Created: **{', '.join(created)}**")
-        if skipped: parts.append(f"⏭️ Already existed: {', '.join(skipped)}")
-        await _reply(message, "\n".join(parts) or "Nothing to do.")
-
-    async def _delete_role(self, message, guild: discord.Guild, params: dict) -> None:
-        name = params.get("role_name", "")
-        role = discord.utils.get(guild.roles, name=name)
-        if not role: await _reply(message, f"❌ Role `{name}` not found."); return
-        await role.delete()
-        await _reply(message, f"🗑️ Deleted role **{name}**")
-
-    async def _edit_role_permissions(self, message, guild: discord.Guild, params: dict) -> None:
-        """Grant or revoke actual Discord permissions on a role."""
-        role_name = params.get("role_name", "")
-        grant     = params.get("grant", [])
-        revoke    = params.get("revoke", [])
-
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            await _reply(message, f"❌ Role `{role_name}` not found.")
-            return
-
-        # Build updated permissions
-        perms = role.permissions
-        granted_ok, revoked_ok, failed = [], [], []
-
-        for perm in grant:
-            try:
-                setattr(perms, perm, True)
-                granted_ok.append(perm)
-            except AttributeError:
-                failed.append(f"unknown permission: {perm}")
-
-        for perm in revoke:
-            try:
-                setattr(perms, perm, False)
-                revoked_ok.append(perm)
-            except AttributeError:
-                failed.append(f"unknown permission: {perm}")
-
-        await role.edit(permissions=perms, reason=f"KLAUD AI — {_author(message)}")
-
-        parts = [f"✅ Updated permissions for **{role.name}**:"]
-        if granted_ok: parts.append(f"  ➕ Granted: {', '.join(granted_ok)}")
-        if revoked_ok: parts.append(f"  ➖ Revoked: {', '.join(revoked_ok)}")
-        if failed:     parts.append(f"  ⚠️ Unknown perms skipped: {', '.join(failed)}")
-        await _reply(message, "\n".join(parts))
-
-    async def _move_role_to_top(self, message, guild: discord.Guild, params: dict) -> None:
-        """Move a role to just below the bot's own highest role."""
-        role_name = params.get("role_name", "")
-        role      = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            await _reply(message, f"❌ Role `{role_name}` not found.")
-            return
-
-        bot_top = guild.me.top_role
-        # Place it one below the bot's top role
-        target_position = max(bot_top.position - 1, 1)
-
-        try:
-            await role.edit(position=target_position, reason=f"KLAUD AI — {_author(message)}")
-            await _reply(message, f"✅ Moved **{role.name}** to position {target_position} (just below my role)")
-        except discord.Forbidden:
-            await _reply(message, f"❌ Can't move **{role.name}** — it may already be above my role.")
-
-    async def _assign_role(self, message, guild: discord.Guild, params: dict) -> None:
-        role = discord.utils.get(guild.roles, name=params.get("role_name", ""))
-        if not role:
-            await _reply(message, f"❌ Role `{params.get('role_name')}` not found.")
-            return
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ User not found. Mention them in the message.")
-            return
-        await member.add_roles(role, reason="KLAUD AI")
-        await _reply(message, f"✅ Gave **{role.name}** to {member.mention}")
-
-    async def _remove_role(self, message, guild: discord.Guild, params: dict) -> None:
-        role = discord.utils.get(guild.roles, name=params.get("role_name", ""))
-        if not role:
-            await _reply(message, f"❌ Role `{params.get('role_name')}` not found.")
-            return
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ User not found. Mention them in the message.")
-            return
-        await member.remove_roles(role, reason="KLAUD AI")
-        await _reply(message, f"✅ Removed **{role.name}** from {member.mention}")
-
-    # ─── Moderation handlers ───────────────────────────────────────────────────
-
-    async def _purge_messages(self, message, guild: discord.Guild, params: dict) -> None:
-        amount  = min(int(params.get("amount", 10)), 100)
-        ch_name = params.get("channel_name", "CURRENT")
-        ch      = (getattr(message, "channel", None) if ch_name == "CURRENT"
-                   else discord.utils.get(guild.text_channels, name=ch_name))
-        if not ch: await _reply(message, f"❌ Channel `{ch_name}` not found."); return
-        deleted = await ch.purge(limit=amount)
-        await _reply(message, f"🗑️ Purged **{len(deleted)}** messages from {ch.mention}")
-
-    async def _kick_user(self, message, guild: discord.Guild, params: dict) -> None:
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ No user found. Mention them in the message.")
-            return
-        # Hierarchy check BEFORE trying
-        if member.top_role >= guild.me.top_role:
-            await _reply(message,
-                f"❌ Can't kick **{member}** — their role is equal to or above mine.\n"
-                "Drag the **KLAUD-NINJA** role above theirs in Server Settings → Roles.")
-            return
-        reason = params.get("reason", "Requested by admin")
-        try: await member.send(f"You were kicked from **{guild.name}**. Reason: {reason}")
-        except Exception: pass
-        await guild.kick(member, reason=f"KLAUD AI: {reason}")
-        await _reply(message, f"👢 Kicked **{member.name}**. Reason: {reason}")
-
-    async def _ban_user(self, message, guild: discord.Guild, params: dict) -> None:
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ No user found. Mention them in the message.")
-            return
-        # Hierarchy check BEFORE trying
-        if member.top_role >= guild.me.top_role:
-            await _reply(message,
-                f"❌ Can't ban **{member}** — their role is equal to or above mine.\n"
-                "Drag the **KLAUD-NINJA** role above theirs in Server Settings → Roles.")
-            return
-        reason = params.get("reason", "Requested by admin")
-        try: await member.send(f"You were banned from **{guild.name}**. Reason: {reason}")
-        except Exception: pass
-        await guild.ban(member, reason=f"KLAUD AI: {reason}",
-                         delete_message_days=int(params.get("delete_days", 0)))
-        await _reply(message, f"🔨 Banned **{member.name}**. Reason: {reason}")
-
-    async def _unban_user(self, message, guild: discord.Guild, params: dict) -> None:
-        user_id = int(params.get("user_id", 0))
-        if not user_id:
-            await _reply(message, "❌ Provide the user ID to unban.")
-            return
-        try:
-            user = await self.bot.fetch_user(user_id)
-            await guild.unban(user, reason=f"KLAUD AI — {_author(message)}")
-            await _reply(message, f"✅ Unbanned **{user}**")
-        except discord.NotFound:
-            await _reply(message, "❌ User not found or not banned.")
-
-    async def _timeout_user(self, message, guild: discord.Guild, params: dict) -> None:
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ No user found. Mention them in the message.")
-            return
-        if member.top_role >= guild.me.top_role:
-            await _reply(message,
-                f"❌ Can't timeout **{member}** — their role is above mine.")
-            return
-        mins   = int(params.get("duration_minutes", 10))
-        reason = params.get("reason", "Requested by admin")
-        await member.timeout(timedelta(minutes=mins), reason=f"KLAUD AI: {reason}")
-        await _reply(message, f"🔇 Timed out **{member.name}** for {mins} minute(s). Reason: {reason}")
-
-    async def _untimeout_user(self, message, guild: discord.Guild, params: dict) -> None:
-        member = _resolve_member(message, guild, params.get("user_mention", ""))
-        if not member:
-            await _reply(message, "❌ No user found.")
-            return
-        await member.timeout(None, reason=f"KLAUD AI — {_author(message)}")
-        await _reply(message, f"✅ Removed timeout from **{member.name}**")
-
-    # ─── Setup handlers ────────────────────────────────────────────────────────
-
-    async def _setup_verification(self, message, guild: discord.Guild, params: dict) -> None:
-        ch_name   = params.get("channel_name", "verify")
-        role_name = params.get("role_name", "Verified")
-        role = discord.utils.get(guild.roles, name=role_name)
-        if not role:
-            role = await guild.create_role(name=role_name, reason="KLAUD verification")
-        ch = discord.utils.get(guild.text_channels, name=ch_name)
-        if not ch:
-            ch = await guild.create_text_channel(ch_name)
-        embed = discord.Embed(
-            title="✅ Server Verification",
-            description="Click below to verify and gain access to the server.",
-            color=discord.Color.green(),
-        )
-        try:
-            vc = self.bot.cogs.get("SetupVerify")
-            if vc and hasattr(vc, "VerificationView"):
-                await ch.send(embed=embed, view=vc.VerificationView(role_id=role.id))
             else:
-                await ch.send(embed=embed)
-        except Exception:
-            await ch.send(embed=embed)
-        await _reply(message, f"✅ Verification set up in {ch.mention} with role **{role.name}**")
-
-    async def _setup_basic_server(self, message, guild: discord.Guild, params: dict) -> None:
-        status  = await _reply(message, "⚙️ Building basic server structure...")
-        created = []
-        for rname, hex_col in [("Member","#808080"),("Moderator","#FF8C00"),
-                                 ("VIP","#FFD700"),("Staff","#FF4500")]:
-            if not discord.utils.get(guild.roles, name=rname):
-                try:
-                    await guild.create_role(name=rname, color=discord.Color(int(hex_col.lstrip("#"), 16)))
-                    created.append(f"Role: {rname}")
-                    await asyncio.sleep(_API_DELAY)
-                except Exception: pass
-        for cat_name, channels in {
-            "📋 Information": ["rules","announcements","roles"],
-            "💬 General":     ["general","off-topic","bot-commands"],
-            "🛡️ Staff":       ["staff-chat","mod-log"],
-        }.items():
-            try:
-                cat = discord.utils.get(guild.categories, name=cat_name) or \
-                      await guild.create_category(cat_name)
-                for ch_name in channels:
-                    if not discord.utils.get(guild.text_channels, name=ch_name):
-                        await guild.create_text_channel(ch_name, category=cat)
-                        created.append(f"#{ch_name}")
-                        await asyncio.sleep(_API_DELAY)
-            except Exception as exc:
-                logger.warning(f"Setup error: {exc}")
-        result = f"✅ Done:\n" + "\n".join(f"  ✅ {i}" for i in created) if created else "✅ Nothing new needed."
-        if status and hasattr(status, "edit"):
-            try: await status.edit(content=result); return
-            except Exception: pass
-        await _reply(message, result)
-
-    # ─── Help ──────────────────────────────────────────────────────────────────
-
-    async def _send_help(self, message: discord.Message) -> None:
-        embed = discord.Embed(
-            title="👋 Hey! I'm KLAUD.",
-            description="I can manage your server AND have a conversation. Just @mention me and talk normally.",
-            color=discord.Color.blurple(),
-        )
-        embed.add_field(name="📁 Channels", value=(
-            "`@Klaud delete all channels`\n"
-            "`@Klaud create a trading category with #buy-sell and #price-check`\n"
-            "`@Klaud make 3 gaming voice channels`\n"
-            "`@Klaud lock this channel`\n"
-            "`@Klaud purge 50 messages`"
-        ), inline=False)
-        embed.add_field(name="🏷️ Roles", value=(
-            "`@Klaud create roles for Admin, Mod, VIP`\n"
-            "`@Klaud give Moderator the ability to kick and ban`\n"
-            "`@Klaud move the Admin role to the top`"
-        ), inline=False)
-        embed.add_field(name="🔨 Moderation", value=(
-            "`@Klaud ban @user for raiding`\n"
-            "`@Klaud timeout @user for 30 minutes`\n"
-            "`@Klaud kick @user`"
-        ), inline=False)
-        embed.add_field(name="💬 Chat", value=(
-            "`@Klaud what can you do?`\n"
-            "`@Klaud how does verification work?`\n"
-            "`@Klaud what's the best channel structure for a gaming server?`"
-        ), inline=False)
-        embed.set_footer(text="Powered by Groq AI • llama-3.3-70b-versatile")
-        await message.reply(embed=embed, mention_author=False)
-
-    # ─── Audit log ─────────────────────────────────────────────────────────────
-
-    async def _log_audit(self, guild, user_id, action_type, details, success=True, error=None) -> None:
-        try:
-            ds = json.dumps(details)[:2000] if details else "{}"
-            if self.bot.db.is_postgres():
-                await self.bot.db.execute(
-                    "INSERT INTO audit_log (guild_id,user_id,action_type,details,success,error_msg) "
-                    "VALUES ($1,$2,$3,$4::jsonb,$5,$6)",
-                    guild.id, user_id, action_type, ds, success, error)
-            else:
-                await self.bot.db.execute(
-                    None, guild.id, user_id, action_type, ds, 1 if success else 0, error,
+                row = await self._db.fetchrow(
+                    None,
+                    guild_id,
                     sqlite_query=(
-                        "INSERT INTO audit_log (guild_id,user_id,action_type,details,success,error_msg) "
-                        "VALUES (?,?,?,?,?,?)"))
+                        "SELECT * FROM licenses WHERE server_id = ? "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                )
+
+            if not row:
+                return None
+
+            return self._row_to_record(row)
+
         except Exception as exc:
-            logger.error(f"Audit log error: {exc}")
+            logger.error(f"Error fetching license for guild {guild_id}: {exc}")
+            return None
 
+    def _row_to_record(self, row: dict) -> LicenseRecord:
+        """Convert a database row dict into a LicenseRecord dataclass."""
 
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+        def _parse_dt(val) -> Optional[datetime]:
+            if val is None:
+                return None
+            if isinstance(val, datetime):
+                return val.replace(tzinfo=timezone.utc) if not val.tzinfo else val
+            if isinstance(val, str):
+                try:
+                    dt = datetime.fromisoformat(val)
+                    return dt.replace(tzinfo=timezone.utc) if not dt.tzinfo else dt
+                except ValueError:
+                    return None
+            return None
 
-class _ResultCollector:
-    def __init__(self):
-        self.last = ""
-        self.channel = None
-        self.mentions = []
-    async def reply(self, content=None, **kwargs):
-        if content: self.last = str(content)
-        return self
-    async def edit(self, **kwargs): pass
+        return LicenseRecord(
+            id          = int(row.get("id", 0)),
+            license_key = str(row.get("license_key", "")),
+            server_id   = int(row["server_id"]) if row.get("server_id") else None,
+            owner_id    = int(row["owner_id"])  if row.get("owner_id")  else None,
+            tier        = str(row.get("tier", "BASIC")).upper(),
+            created_at  = _parse_dt(row.get("created_at")) or datetime.now(timezone.utc),
+            expires_at  = _parse_dt(row.get("expires_at")),
+            active      = bool(row.get("active", False)),
+            redeemed_at = _parse_dt(row.get("redeemed_at")),
+            redeemed_by = int(row["redeemed_by"]) if row.get("redeemed_by") else None,
+        )
 
+    async def _get_cache(self, guild_id: int) -> Optional[LicenseCacheEntry]:
+        async with self._cache_lock:
+            return self._cache.get(guild_id)
 
-async def _reply(message, content: str = None, **kwargs):
-    """Safe reply that falls back to channel.send on NotFound."""
-    if isinstance(message, _ResultCollector):
-        if content: message.last = content
-        return message
-    try:
-        return await message.reply(content, mention_author=False, **kwargs)
-    except discord.NotFound:
-        try: return await message.channel.send(content, **kwargs)
-        except Exception: return None
-    except discord.HTTPException:
-        return None
+    async def _set_cache(
+        self,
+        guild_id: int,
+        valid: bool,
+        tier: str,
+        record: Optional[LicenseRecord],
+    ) -> None:
+        async with self._cache_lock:
+            self._cache[guild_id] = LicenseCacheEntry(
+                valid=valid,
+                tier=tier,
+                record=record,
+                cached_at=time.monotonic(),
+                ttl=self._cache_ttl,
+            )
 
+    async def _invalidate_cache(self, guild_id: int) -> None:
+        async with self._cache_lock:
+            self._cache.pop(guild_id, None)
 
-def _author(message) -> str:
-    return str(getattr(message, "author", "admin"))
-
-
-def _resolve_member(message, guild: discord.Guild, mention_str: str) -> Optional[discord.Member]:
-    if hasattr(message, "mentions") and message.mentions:
-        # Skip the bot itself
-        for m in message.mentions:
-            if not m.bot:
-                return guild.get_member(m.id)
-    if mention_str:
-        uid = mention_str.strip("<@!> ")
-        try: return guild.get_member(int(uid))
-        except ValueError: pass
-    return None
-
-
-async def setup(bot: KlaudBot) -> None:
-    await bot.add_cog(AdminAICog(bot))
+    def __repr__(self) -> str:
+        return (
+            f"LicenseManager("
+            f"cache_size={len(self._cache)}, "
+            f"owner={self._owner_id})"
+        )
