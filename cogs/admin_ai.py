@@ -135,9 +135,13 @@ class AdminAICog(commands.Cog, name="AdminAI"):
 
         # Chat response — just reply naturally
         if decision.action_type == "chat":
-            chat_msg = decision.parameters.get("message", "") if isinstance(decision.parameters, dict) else ""
+            # AI returns message at top level: {"action_type":"chat","message":"..."}
+            # explanation field is used as fallback since from_dict stores it there
+            chat_msg = (
+                decision.parameters.get("message", "") if isinstance(decision.parameters, dict) else ""
+            ) or decision.explanation or ""
             if not chat_msg:
-                chat_msg = decision.explanation or "Hey! How can I help?"
+                chat_msg = "Hey! How can I help?"
             await _reply(message, chat_msg)
             return
 
