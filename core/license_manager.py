@@ -262,7 +262,13 @@ class LicenseManager:
                 return False, "❌ This license key has expired."
 
         # Bind the key to this guild
+        # First clear any existing binding for this guild (avoids UNIQUE constraint on server_id)
         now = datetime.now(timezone.utc)
+        await self._db.execute(
+            "UPDATE licenses SET server_id = NULL WHERE server_id = $1 AND license_key != $2",
+            guild_id, key,
+            sqlite_query="UPDATE licenses SET server_id = NULL WHERE server_id = ? AND license_key != ?",
+        )
         await self._db.execute(
             """
             UPDATE licenses
