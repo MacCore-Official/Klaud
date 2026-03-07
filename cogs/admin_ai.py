@@ -251,6 +251,13 @@ class AdminAICog(commands.Cog, name="AdminAI"):
             "unlock_channel":        self._unlock_channel,
             "set_channel_permissions": self._set_channel_permissions,
             "set_permissions":       self._set_channel_permissions,
+            "assign_role":           self._assign_role,
+            "remove_role":           self._remove_role,
+            "purge_messages":        self._purge_messages,
+            "kick_user":             self._kick_user,
+            "ban_user":              self._ban_user,
+            "timeout_user":          self._timeout_user,
+            "delete_role":           self._delete_role,
         }
         for step in actions:
             at = step.get("action_type", "")
