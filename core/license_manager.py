@@ -269,7 +269,7 @@ class LicenseManager:
             SET server_id = $1, redeemed_at = $2, redeemed_by = $3
             WHERE license_key = $4
             """,
-            guild_id, now, redeemed_by, key,
+            guild_id, now.replace(tzinfo=None), redeemed_by, key,
             sqlite_query=(
                 "UPDATE licenses "
                 "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
@@ -326,7 +326,7 @@ class LicenseManager:
             INSERT INTO licenses (license_key, tier, owner_id, created_at, expires_at, active)
             VALUES ($1, $2, $3, $4, $5, TRUE)
             """,
-            key, tier, created_by, now, expires_at,
+            key, tier, created_by, now.replace(tzinfo=None), expires_at.replace(tzinfo=None) if expires_at else None,
             sqlite_query=(
                 "INSERT INTO licenses "
                 "(license_key, tier, owner_id, created_at, expires_at, active) "
@@ -377,7 +377,7 @@ class LicenseManager:
             SET server_id = $1, redeemed_at = $2, redeemed_by = $3
             WHERE license_key = $4
             """,
-            guild_id, now, activated_by, key,
+            guild_id, now.replace(tzinfo=None), activated_by, key,
             sqlite_query=(
                 "UPDATE licenses "
                 "SET server_id = ?, redeemed_at = ?, redeemed_by = ? "
